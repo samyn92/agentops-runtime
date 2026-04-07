@@ -34,15 +34,30 @@ type Session struct {
 	CreatedAt    time.Time         `json:"created_at"`
 	UpdatedAt    time.Time         `json:"updated_at"`
 	MessageCount int               `json:"message_count"`
+	// Usage from the last agent call (persisted for the console to display on reload)
+	TotalUsage *sessionUsage `json:"total_usage,omitempty"`
+	Model      string        `json:"model,omitempty"`
+}
+
+// sessionUsage stores token counts from the last agent call.
+type sessionUsage struct {
+	InputTokens         int64 `json:"input_tokens"`
+	OutputTokens        int64 `json:"output_tokens"`
+	TotalTokens         int64 `json:"total_tokens"`
+	ReasoningTokens     int64 `json:"reasoning_tokens"`
+	CacheCreationTokens int64 `json:"cache_creation_tokens"`
+	CacheReadTokens     int64 `json:"cache_read_tokens"`
 }
 
 // SessionInfo is the API-facing representation of a session (times as RFC3339).
 type SessionInfo struct {
-	ID           string `json:"id"`
-	Title        string `json:"title"`
-	CreatedAt    string `json:"created_at"`
-	UpdatedAt    string `json:"updated_at"`
-	MessageCount int    `json:"message_count"`
+	ID           string        `json:"id"`
+	Title        string        `json:"title"`
+	CreatedAt    string        `json:"created_at"`
+	UpdatedAt    string        `json:"updated_at"`
+	MessageCount int           `json:"message_count"`
+	TotalUsage   *sessionUsage `json:"total_usage,omitempty"`
+	Model        string        `json:"model,omitempty"`
 }
 
 // Info returns an API-safe representation with RFC3339 timestamps.
@@ -53,6 +68,8 @@ func (s *Session) Info() SessionInfo {
 		CreatedAt:    s.CreatedAt.Format(time.RFC3339),
 		UpdatedAt:    s.UpdatedAt.Format(time.RFC3339),
 		MessageCount: s.MessageCount,
+		TotalUsage:   s.TotalUsage,
+		Model:        s.Model,
 	}
 }
 
@@ -67,6 +84,8 @@ type serializableSession struct {
 	CreatedAt    time.Time             `json:"created_at"`
 	UpdatedAt    time.Time             `json:"updated_at"`
 	MessageCount int                   `json:"message_count"`
+	TotalUsage   *sessionUsage         `json:"total_usage,omitempty"`
+	Model        string                `json:"model,omitempty"`
 }
 
 type serializableMessage struct {
@@ -270,6 +289,8 @@ func (ss *SessionStore) loadFromDisk() {
 			CreatedAt:    stored.CreatedAt,
 			UpdatedAt:    stored.UpdatedAt,
 			MessageCount: stored.MessageCount,
+			TotalUsage:   stored.TotalUsage,
+			Model:        stored.Model,
 		}
 		for _, sm := range stored.Messages {
 			s.Messages = append(s.Messages, deserializeMessage(sm))
@@ -296,6 +317,8 @@ func (ss *SessionStore) persist(s *Session) {
 		CreatedAt:    s.CreatedAt,
 		UpdatedAt:    s.UpdatedAt,
 		MessageCount: s.MessageCount,
+		TotalUsage:   s.TotalUsage,
+		Model:        s.Model,
 	}
 	for _, msg := range s.Messages {
 		stored.Messages = append(stored.Messages, serializeMessage(msg))
@@ -433,5 +456,26 @@ func (ss *SessionStore) UpdateTitle(id string, title string) {
 	}
 	s.Title = title
 	s.UpdatedAt = time.Now()
+	ss.persist(s)
+}
+
+// UpdateUsage stores the total token usage and model for a session.
+// Called after agent_finish so the data survives a browser refresh.
+func (ss *SessionStore) UpdateUsage(id string, usage fantasy.Usage, model string) {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	s, ok := ss.sessions[id]
+	if !ok {
+		return
+	}
+	s.TotalUsage = &sessionUsage{
+		InputTokens:         usage.InputTokens,
+		OutputTokens:        usage.OutputTokens,
+		TotalTokens:         usage.TotalTokens,
+		ReasoningTokens:     usage.ReasoningTokens,
+		CacheCreationTokens: usage.CacheCreationTokens,
+		CacheReadTokens:     usage.CacheReadTokens,
+	}
+	s.Model = model
 	ss.persist(s)
 }
