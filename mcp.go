@@ -16,6 +16,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"charm.land/fantasy"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -74,7 +76,7 @@ func loadOCITools(ctx context.Context, toolRefs []ToolEntry) ([]fantasy.AgentToo
 		}
 		conns = append(conns, *conn)
 
-		mcpTools, err := discoverMCPTools(ctx, conn.session, ref.Name)
+		mcpTools, err := discoverMCPTools(ctx, conn.session, ref.Name, "stdio")
 		if err != nil {
 			slog.Error("failed to discover MCP tools", "tool", ref.Name, "error", err)
 			continue
@@ -102,7 +104,7 @@ func loadGatewayMCPTools(ctx context.Context, mcpServers []MCPEntry) ([]fantasy.
 		}
 		conns = append(conns, *conn)
 
-		mcpTools, err := discoverMCPTools(ctx, conn.session, srv.Name)
+		mcpTools, err := discoverMCPTools(ctx, conn.session, srv.Name, "sse")
 		if err != nil {
 			slog.Error("failed to discover MCP tools from gateway", "server", srv.Name, "error", err)
 			continue
@@ -156,7 +158,7 @@ func startSSEMCP(ctx context.Context, name, sseURL string) (*mcpConnection, erro
 }
 
 // discoverMCPTools lists tools from an MCP session and wraps as fantasy.AgentTool.
-func discoverMCPTools(ctx context.Context, session *mcp.ClientSession, serverName string) ([]fantasy.AgentTool, error) {
+func discoverMCPTools(ctx context.Context, session *mcp.ClientSession, serverName string, transport string) ([]fantasy.AgentTool, error) {
 	result, err := session.ListTools(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("list tools: %w", err)
@@ -164,7 +166,7 @@ func discoverMCPTools(ctx context.Context, session *mcp.ClientSession, serverNam
 
 	var tools []fantasy.AgentTool
 	for _, t := range result.Tools {
-		tools = append(tools, newMCPToolAdapter(session, serverName, t))
+		tools = append(tools, newMCPToolAdapter(session, serverName, t, transport))
 	}
 	return tools, nil
 }
@@ -174,14 +176,16 @@ type mcpToolAdapter struct {
 	session    *mcp.ClientSession
 	serverName string
 	mcpTool    *mcp.Tool
+	transport  string // "stdio" (OCI/inline) or "sse" (gateway/CRD)
 	opts       fantasy.ProviderOptions
 }
 
-func newMCPToolAdapter(session *mcp.ClientSession, serverName string, tool *mcp.Tool) *mcpToolAdapter {
+func newMCPToolAdapter(session *mcp.ClientSession, serverName string, tool *mcp.Tool, transport string) *mcpToolAdapter {
 	return &mcpToolAdapter{
 		session:    session,
 		serverName: serverName,
 		mcpTool:    tool,
+		transport:  transport,
 	}
 }
 
@@ -215,6 +219,8 @@ func (m *mcpToolAdapter) Run(ctx context.Context, call fantasy.ToolCall) (fantas
 		return fantasy.NewTextErrorResponse(fmt.Sprintf("invalid input: %s", err)), nil
 	}
 
+	start := time.Now()
+
 	result, err := m.session.CallTool(ctx, &mcp.CallToolParams{
 		Name:      m.mcpTool.Name,
 		Arguments: args,
@@ -222,6 +228,8 @@ func (m *mcpToolAdapter) Run(ctx context.Context, call fantasy.ToolCall) (fantas
 	if err != nil {
 		return fantasy.NewTextErrorResponse(fmt.Sprintf("MCP tool call failed: %s", err)), nil
 	}
+
+	elapsed := time.Since(start)
 
 	// Collect text content from result
 	var text string
@@ -231,10 +239,24 @@ func (m *mcpToolAdapter) Run(ctx context.Context, call fantasy.ToolCall) (fantas
 		}
 	}
 
-	if result.IsError {
-		return fantasy.NewTextErrorResponse(text), nil
+	// Build metadata for the frontend
+	metadata := map[string]any{
+		"server":    m.serverName,
+		"tool":      m.mcpTool.Name,
+		"transport": m.transport,
+		"duration":  elapsed.Milliseconds(),
 	}
-	return fantasy.NewTextResponse(text), nil
+	// Detect a UI hint from the tool/server name
+	if ui := detectMCPUIHint(m.serverName, m.mcpTool.Name); ui != "" {
+		metadata["ui"] = ui
+	}
+
+	if result.IsError {
+		resp := fantasy.NewTextErrorResponse(text)
+		return fantasy.WithResponseMetadata(resp, metadata), nil
+	}
+	resp := fantasy.NewTextResponse(text)
+	return fantasy.WithResponseMetadata(resp, metadata), nil
 }
 
 func (m *mcpToolAdapter) ProviderOptions() fantasy.ProviderOptions {
@@ -243,6 +265,19 @@ func (m *mcpToolAdapter) ProviderOptions() fantasy.ProviderOptions {
 
 func (m *mcpToolAdapter) SetProviderOptions(opts fantasy.ProviderOptions) {
 	m.opts = opts
+}
+
+// detectMCPUIHint returns a UI renderer hint based on the MCP server/tool name.
+// This allows the frontend to render branded cards for known MCP tool categories.
+func detectMCPUIHint(serverName, toolName string) string {
+	combined := strings.ToLower(serverName + " " + toolName)
+	if strings.Contains(combined, "kubectl") || strings.Contains(combined, "kubernetes") || strings.Contains(combined, "k8s") {
+		return "kubernetes-resources"
+	}
+	if strings.Contains(combined, "helm") {
+		return "helm-release"
+	}
+	return ""
 }
 
 // shutdownMCPConnections gracefully closes all MCP connections.
