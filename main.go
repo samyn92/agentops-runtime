@@ -713,6 +713,11 @@ func (s *daemonServer) handleSessionPrompt(w http.ResponseWriter, r *http.Reques
 
 	messages := s.sessions.GetMessages(sessionId)
 
+	// Fire title generation immediately (background goroutine, doesn't block)
+	if sess.MessageCount == 0 {
+		s.generateTitle(sessionId, req.Prompt)
+	}
+
 	result, usedModel, err := generateWithFallback(ctx, s.cfg, s.bundle, fantasy.AgentCall{
 		Prompt:   req.Prompt,
 		Messages: messages,
@@ -730,11 +735,6 @@ func (s *daemonServer) handleSessionPrompt(w http.ResponseWriter, r *http.Reques
 		s.sessions.AppendMessages(sessionId, step.Messages...)
 	}
 
-	// Auto-title if this is the first message (AI-generated, fire-and-forget)
-	if sess.MessageCount == 0 {
-		s.generateTitle(sessionId, req.Prompt)
-	}
-
 	s.mu.Lock()
 	s.activeModel = usedModel
 	s.totalSteps += len(result.Steps)
@@ -748,7 +748,7 @@ func (s *daemonServer) handleSessionPrompt(w http.ResponseWriter, r *http.Reques
 
 func (s *daemonServer) handleSessionPromptStream(w http.ResponseWriter, r *http.Request) {
 	sessionId := r.PathValue("id")
-	_, ok := s.sessions.Get(sessionId)
+	sess, ok := s.sessions.Get(sessionId)
 	if !ok {
 		http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
 		return
@@ -808,6 +808,11 @@ func (s *daemonServer) handleSessionPromptStream(w http.ResponseWriter, r *http.
 
 	// Get conversation history for this session
 	messages := s.sessions.GetMessages(sessionId)
+
+	// Fire title generation immediately (background goroutine, doesn't block)
+	if sess.MessageCount == 0 {
+		s.generateTitle(sessionId, req.Prompt)
+	}
 
 	// Step counter (shared across callbacks)
 	var stepCount int
@@ -971,12 +976,6 @@ func (s *daemonServer) handleSessionPromptStream(w http.ResponseWriter, r *http.
 		s.sessions.AppendMessages(sessionId, fantasy.NewUserMessage(req.Prompt))
 		for _, step := range result.Steps {
 			s.sessions.AppendMessages(sessionId, step.Messages...)
-		}
-
-		// Auto-title from first prompt (AI-generated, fire-and-forget)
-		sess, ok := s.sessions.Get(sessionId)
-		if ok && sess.MessageCount <= 2 {
-			s.generateTitle(sessionId, req.Prompt)
 		}
 
 		stepMu.Lock()
