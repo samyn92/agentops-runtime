@@ -119,7 +119,7 @@ func (g *permissionGate) wrapTool(tool fantasy.AgentTool, requireApproval bool) 
 
 				// Get sessionId from context
 				sessionId := ""
-				if sid, ok := ctx.Value(sessionIdContextKey{}).(string); ok {
+				if sid, ok := ctx.Value(agentContextKey{}).(string); ok {
 					sessionId = sid
 				}
 
@@ -145,8 +145,8 @@ func (g *permissionGate) wrapTool(tool fantasy.AgentTool, requireApproval bool) 
 	)
 }
 
-// sessionIdContextKey is the context key for storing session ID.
-type sessionIdContextKey struct{}
+// agentContextKey is the context key for storing the agent name.
+type agentContextKey struct{}
 
 // wrapTools wraps multiple tools, applying permission gates to the specified tool names.
 func (g *permissionGate) wrapTools(tools []fantasy.AgentTool, requireApprovalFor []string) []fantasy.AgentTool {

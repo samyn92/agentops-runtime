@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	apiGroup       = "agents.agenticops.io"
+	apiGroup       = "agents.agentops.io"
 	apiVersion     = "v1alpha1"
 	agentRunPlural = "agentruns"
 )
@@ -87,7 +87,7 @@ func (k *K8sClient) CreateAgentRun(ctx context.Context, agentRef, prompt, source
 				"name":      name,
 				"namespace": k.namespace,
 				"labels": map[string]interface{}{
-					"agents.agenticops.io/agent": agentRef,
+					"agents.agentops.io/agent": agentRef,
 				},
 			},
 			"spec": map[string]interface{}{

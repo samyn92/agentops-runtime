@@ -117,7 +117,7 @@ func newQuestionTool(gate *questionGate) fantasy.AgentTool {
 
 			// Get sessionId from context
 			sessionId := ""
-			if sid, ok := ctx.Value(sessionIdContextKey{}).(string); ok {
+			if sid, ok := ctx.Value(agentContextKey{}).(string); ok {
 				sessionId = sid
 			}
 

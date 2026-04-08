@@ -119,7 +119,7 @@ func loadGatewayMCPTools(ctx context.Context, mcpServers []MCPEntry) ([]fantasy.
 
 // startStdioMCP starts an MCP server process and connects via stdio.
 func startStdioMCP(ctx context.Context, name, binPath string) (*mcpConnection, error) {
-	impl := &mcp.Implementation{Name: "agenticops-fantasy", Version: "0.1.0"}
+	impl := &mcp.Implementation{Name: "agentops-fantasy", Version: "0.1.0"}
 	client := mcp.NewClient(impl, nil)
 
 	transport := &mcp.CommandTransport{
@@ -140,7 +140,7 @@ func startStdioMCP(ctx context.Context, name, binPath string) (*mcpConnection, e
 
 // startSSEMCP connects to an MCP server via SSE transport.
 func startSSEMCP(ctx context.Context, name, sseURL string) (*mcpConnection, error) {
-	impl := &mcp.Implementation{Name: "agenticops-fantasy", Version: "0.1.0"}
+	impl := &mcp.Implementation{Name: "agentops-fantasy", Version: "0.1.0"}
 	client := mcp.NewClient(impl, nil)
 
 	transport := &mcp.SSEClientTransport{Endpoint: sseURL}

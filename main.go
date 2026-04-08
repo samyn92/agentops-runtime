@@ -16,11 +16,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
-	"time"
 
 	"charm.land/fantasy"
 )
@@ -293,42 +291,69 @@ func runDaemon() error {
 	}
 	defer shutdownMCPConnections(bundle.mcpConns)
 
-	// Session data directory: /data/sessions by default, override with DATA_DIR env var.
-	sessionDir := "/data/sessions"
-	if d := os.Getenv("DATA_DIR"); d != "" {
-		sessionDir = filepath.Join(d, "sessions")
+	// Determine agent name (used as Engram project scope)
+	agentName := os.Getenv("AGENT_NAME")
+	if agentName == "" {
+		agentName = "default"
 	}
+
+	// Initialize memory system
+	windowSize := 20
+	contextLimit := 5
+	var engram *EngramClient
+
+	if cfg.Memory != nil {
+		if cfg.Memory.WindowSize > 0 {
+			windowSize = cfg.Memory.WindowSize
+		}
+		if cfg.Memory.ContextLimit > 0 {
+			contextLimit = cfg.Memory.ContextLimit
+		}
+
+		project := cfg.Memory.Project
+		if project == "" {
+			project = agentName
+		}
+
+		engram = NewEngramClient(cfg.Memory.ServerURL, project)
+		if err := engram.Init(); err != nil {
+			slog.Warn("engram init failed, running without persistent memory", "error", err)
+			engram = nil
+		}
+	}
+
+	_ = contextLimit // used in prompt handlers via cfg
 
 	srv := &daemonServer{
 		bundle:      bundle,
 		cfg:         cfg,
-		sessions:    NewSessionStore(sessionDir),
+		memory:      NewWorkingMemory(windowSize),
+		engram:      engram,
 		activeModel: cfg.PrimaryModel,
-		sessionCtx:  make(map[string]*sessionContext),
+		agentName:   agentName,
+		convCtx:     &sessionContext{},
 	}
 
-	// Initialize permission gate (emits permission_asked via the session's active SSE emitter)
+	// Initialize permission gate (emits permission_asked via the active SSE emitter)
 	srv.permGate = newPermissionGate(
 		func(id, sessionId, toolName, input, description string) {
-			sc := srv.getOrCreateSessionCtx(sessionId)
-			sc.mu.Lock()
-			emit := sc.emitter
-			sc.mu.Unlock()
+			srv.convCtx.mu.Lock()
+			emit := srv.convCtx.emitter
+			srv.convCtx.mu.Unlock()
 			if emit != nil {
-				emit.emitPermissionAsked(id, sessionId, toolName, input, description)
+				emit.emitPermissionAsked(id, srv.agentName, toolName, input, description)
 			}
 		},
 	)
 
-	// Initialize question gate (emits question_asked via the session's active SSE emitter)
+	// Initialize question gate (emits question_asked via the active SSE emitter)
 	srv.questionGate = newQuestionGate(
 		func(id, sessionId string, questions json.RawMessage) {
-			sc := srv.getOrCreateSessionCtx(sessionId)
-			sc.mu.Lock()
-			emit := sc.emitter
-			sc.mu.Unlock()
+			srv.convCtx.mu.Lock()
+			emit := srv.convCtx.emitter
+			srv.convCtx.mu.Unlock()
 			if emit != nil {
-				emit.emitQuestionAsked(id, sessionId, questions)
+				emit.emitQuestionAsked(id, srv.agentName, questions)
 			}
 		},
 	)
@@ -432,28 +457,17 @@ func runDaemon() error {
 
 	mux := http.NewServeMux()
 
-	// Legacy endpoints (kept for backward compat, use default session)
-	mux.HandleFunc("POST /prompt", srv.handlePromptLegacy)
-	mux.HandleFunc("POST /prompt/stream", srv.handlePromptStreamLegacy)
+	// Prompt endpoints (single conversation per agent — no session ID needed)
+	mux.HandleFunc("POST /prompt", srv.handlePrompt)
+	mux.HandleFunc("POST /prompt/stream", srv.handlePromptStream)
 
-	// Session CRUD
-	mux.HandleFunc("POST /sessions", srv.handleSessionCreate)
-	mux.HandleFunc("GET /sessions", srv.handleSessionList)
-	mux.HandleFunc("GET /sessions/{id}", srv.handleSessionGet)
-	mux.HandleFunc("GET /sessions/{id}/messages", srv.handleSessionMessages)
-	mux.HandleFunc("DELETE /sessions/{id}", srv.handleSessionDelete)
-
-	// Session-scoped prompt/stream
-	mux.HandleFunc("POST /sessions/{id}/prompt", srv.handleSessionPrompt)
-	mux.HandleFunc("POST /sessions/{id}/prompt/stream", srv.handleSessionPromptStream)
-
-	// Session-scoped control
-	mux.HandleFunc("POST /sessions/{id}/steer", srv.handleSessionSteer)
-	mux.HandleFunc("DELETE /sessions/{id}/abort", srv.handleSessionAbort)
+	// Conversation control
+	mux.HandleFunc("POST /steer", srv.handleSteer)
+	mux.HandleFunc("DELETE /abort", srv.handleAbort)
 
 	// Permission and question reply endpoints
-	mux.HandleFunc("POST /sessions/{id}/permission/{pid}/reply", srv.handlePermissionReply)
-	mux.HandleFunc("POST /sessions/{id}/question/{qid}/reply", srv.handleQuestionReply)
+	mux.HandleFunc("POST /permission/{pid}/reply", srv.handlePermissionReply)
+	mux.HandleFunc("POST /question/{qid}/reply", srv.handleQuestionReply)
 
 	// Health and status
 	mux.HandleFunc("GET /healthz", srv.handleHealthz)
@@ -464,6 +478,10 @@ func runDaemon() error {
 	go func() {
 		<-ctx.Done()
 		slog.Info("shutting down...")
+		// End Engram session on graceful shutdown
+		if srv.engram != nil {
+			srv.engram.EndSession("")
+		}
 		httpSrv.Close()
 	}()
 
@@ -471,14 +489,15 @@ func runDaemon() error {
 	return httpSrv.ListenAndServe()
 }
 
-// sessionContext tracks per-session runtime state (cancel func, busy flag, steer msgs).
+// sessionContext tracks per-conversation runtime state (cancel func, busy flag, steer msgs).
+// With the memory rewrite there is one conversation per daemon agent, so only
+// one sessionContext exists, but we keep the type for steer/abort/permission/question.
 type sessionContext struct {
-	mu        sync.Mutex
-	busy      bool
-	cancel    context.CancelFunc
-	steerMsg  string      // pending steer message, consumed on next step boundary
-	emitter   *fepEmitter // current SSE emitter (set during streaming)
-	sessionId string      // this session's ID
+	mu       sync.Mutex
+	busy     bool
+	cancel   context.CancelFunc
+	steerMsg string      // pending steer message, consumed on next step boundary
+	emitter  *fepEmitter // current SSE emitter (set during streaming)
 }
 
 func (sc *sessionContext) popSteerMessage() string {
@@ -492,103 +511,23 @@ func (sc *sessionContext) popSteerMessage() string {
 type daemonServer struct {
 	bundle       *agentBundle
 	cfg          *Config
-	sessions     *SessionStore
+	memory       *WorkingMemory
+	engram       *EngramClient
 	activeModel  string
 	totalSteps   int
+	agentName    string // from AGENT_NAME env var
 	permGate     *permissionGate
 	questionGate *questionGate
 
-	mu         sync.Mutex
-	sessionCtx map[string]*sessionContext // sessionId -> runtime context
-}
-
-// getOrCreateSessionCtx returns (or creates) the runtime context for a session.
-func (s *daemonServer) getOrCreateSessionCtx(sessionId string) *sessionContext {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	sc, ok := s.sessionCtx[sessionId]
-	if !ok {
-		sc = &sessionContext{}
-		s.sessionCtx[sessionId] = sc
-	}
-	return sc
-}
-
-func (s *daemonServer) deleteSessionCtx(sessionId string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if sc, ok := s.sessionCtx[sessionId]; ok {
-		sc.mu.Lock()
-		if sc.cancel != nil {
-			sc.cancel()
-		}
-		sc.mu.Unlock()
-		delete(s.sessionCtx, sessionId)
-	}
-}
-
-// generateTitle fires a background goroutine that calls the LLM to generate
-// a short, descriptive title for a session. Title stays empty until ready;
-// the frontend hides untitled sessions in the sidebar.
-func (s *daemonServer) generateTitle(sessionId, userPrompt string) {
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-
-		// Use titleModel if configured, otherwise fall back to primaryModel
-		modelStr := s.cfg.TitleModel
-		if modelStr == "" {
-			modelStr = s.cfg.PrimaryModel
-		}
-
-		model, err := resolveModel(ctx, modelStr, s.bundle.providers, s.cfg.PrimaryProvider)
-		if err != nil {
-			slog.Warn("title generation: failed to resolve model", "error", err)
-			return
-		}
-
-		temp := 0.3
-		var maxTok int64 = 25
-		titleAgent := fantasy.NewAgent(model,
-			fantasy.WithSystemPrompt("You are a title generator. Given a user message, output ONLY a short title (max 6 words) that summarizes the topic. No explanation, no quotes, no punctuation at the end. Just the title words."),
-			fantasy.WithTemperature(temp),
-			fantasy.WithMaxOutputTokens(maxTok),
-		)
-
-		result, err := titleAgent.Generate(ctx, fantasy.AgentCall{
-			Prompt: fmt.Sprintf("Generate a title for this message: %s", userPrompt),
-		})
-		if err != nil {
-			slog.Warn("title generation: LLM call failed", "error", err)
-			return
-		}
-
-		title := strings.TrimSpace(result.Response.Content.Text())
-		if title == "" {
-			return
-		}
-		// Strip quotes and trailing punctuation the model might add
-		title = strings.Trim(title, `"'`)
-		title = strings.TrimRight(title, ".!?;:,")
-		title = strings.TrimSpace(title)
-		if title == "" {
-			return
-		}
-		if len(title) > 80 {
-			title = truncate(title, 80)
-		}
-
-		s.sessions.UpdateTitle(sessionId, title)
-		slog.Info("session title generated", "session", sessionId, "title", title)
-	}()
+	mu      sync.Mutex
+	convCtx *sessionContext // single conversation context
 }
 
 // ── Request/Response types ──
 
 type promptRequest struct {
-	Prompt    string            `json:"prompt"`
-	SessionID string            `json:"session_id,omitempty"` // optional, for legacy endpoints
-	Context   []ResourceContext `json:"context,omitempty"`    // per-turn resource context from console
+	Prompt  string            `json:"prompt"`
+	Context []ResourceContext `json:"context,omitempty"` // per-turn resource context from console
 }
 
 type promptResponse struct {
@@ -596,111 +535,24 @@ type promptResponse struct {
 	Model  string `json:"model"`
 }
 
-type sessionCreateRequest struct {
-	Title string `json:"title,omitempty"`
-}
-
-type sessionCreateResponse struct {
-	ID    string `json:"id"`
-	Title string `json:"title"`
-}
-
 type steerRequest struct {
 	Message string `json:"message"`
 }
 
-// ── Session CRUD handlers ──
+// ── Prompt handler (non-streaming) ──
 
-func (s *daemonServer) handleSessionCreate(w http.ResponseWriter, r *http.Request) {
-	var req sessionCreateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		// Allow empty body — title defaults to "New Session"
-		req = sessionCreateRequest{}
-	}
-
-	session := s.sessions.Create(req.Title)
-	slog.Info("session created", "id", session.ID, "title", session.Title)
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(sessionCreateResponse{
-		ID:    session.ID,
-		Title: session.Title,
-	})
-}
-
-func (s *daemonServer) handleSessionList(w http.ResponseWriter, _ *http.Request) {
-	sessions := s.sessions.List()
-	infos := make([]SessionInfo, len(sessions))
-	for i, sess := range sessions {
-		infos[i] = sess.Info()
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(infos)
-}
-
-func (s *daemonServer) handleSessionGet(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	session, ok := s.sessions.Get(id)
-	if !ok {
-		http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(session.Info())
-}
-
-func (s *daemonServer) handleSessionMessages(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	msgs, ok := s.sessions.GetSerializedMessages(id)
-	if !ok {
-		http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(msgs)
-}
-
-func (s *daemonServer) handleSessionDelete(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-
-	// Cancel any active work
-	s.deleteSessionCtx(id)
-
-	if !s.sessions.Delete(id) {
-		http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
-		return
-	}
-
-	slog.Info("session deleted", "id", id)
-	w.Header().Set("Content-Type", "application/json")
-	io.WriteString(w, `{"ok":true}`)
-}
-
-// ── Session-scoped prompt (non-streaming) ──
-
-func (s *daemonServer) handleSessionPrompt(w http.ResponseWriter, r *http.Request) {
-	sessionId := r.PathValue("id")
-	sess, ok := s.sessions.Get(sessionId)
-	if !ok {
-		http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
-		return
-	}
-
+func (s *daemonServer) handlePrompt(w http.ResponseWriter, r *http.Request) {
 	var req promptRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Prompt == "" {
 		http.Error(w, `{"error":"prompt is required"}`, http.StatusBadRequest)
 		return
 	}
 
-	sc := s.getOrCreateSessionCtx(sessionId)
+	sc := s.convCtx
 	sc.mu.Lock()
 	if sc.busy {
 		sc.mu.Unlock()
-		http.Error(w, `{"error":"session is busy"}`, http.StatusTooManyRequests)
+		http.Error(w, `{"error":"agent is busy"}`, http.StatusTooManyRequests)
 		return
 	}
 	sc.busy = true
@@ -719,19 +571,26 @@ func (s *daemonServer) handleSessionPrompt(w http.ResponseWriter, r *http.Reques
 	sc.mu.Unlock()
 	defer cancel()
 
-	messages := s.sessions.GetMessages(sessionId)
+	// Get messages from working memory (bounded sliding window)
+	messages := s.memory.Messages()
 
-	// Fire title generation immediately (background goroutine, doesn't block)
-	if sess.MessageCount == 0 {
-		s.generateTitle(sessionId, req.Prompt)
+	// Fetch Engram context (short-term + long-term memories) and prepend
+	effectivePrompt := req.Prompt
+	if s.engram != nil {
+		contextLimit := 5
+		if s.cfg.Memory != nil && s.cfg.Memory.ContextLimit > 0 {
+			contextLimit = s.cfg.Memory.ContextLimit
+		}
+		if engramCtx := s.engram.FetchContext(contextLimit); engramCtx != "" {
+			effectivePrompt = engramCtx + effectivePrompt
+		}
 	}
 
-	// Build the effective prompt: prepend resource context if provided (Option B)
-	effectivePrompt := req.Prompt
+	// Prepend resource context if provided
 	if len(req.Context) > 0 {
 		contextPrefix := formatResourceContext(req.Context)
-		effectivePrompt = contextPrefix + req.Prompt
-		slog.Info("resource context injected", "session", sessionId, "items", len(req.Context))
+		effectivePrompt = contextPrefix + effectivePrompt
+		slog.Info("resource context injected", "items", len(req.Context))
 	}
 
 	result, usedModel, err := generateWithFallback(ctx, s.cfg, s.bundle, fantasy.AgentCall{
@@ -745,10 +604,16 @@ func (s *daemonServer) handleSessionPrompt(w http.ResponseWriter, r *http.Reques
 
 	output := result.Response.Content.Text()
 
-	// Persist conversation history (use original prompt, not enriched)
-	s.sessions.AppendMessages(sessionId, fantasy.NewUserMessage(req.Prompt))
+	// Append to working memory (sliding window — drops oldest when full)
+	s.memory.Append(fantasy.NewUserMessage(req.Prompt))
 	for _, step := range result.Steps {
-		s.sessions.AppendMessages(sessionId, step.Messages...)
+		s.memory.Append(step.Messages...)
+	}
+	s.memory.CompleteTurn()
+
+	// Passive capture to Engram (async, fire-and-forget)
+	if s.engram != nil {
+		s.engram.PassiveCapture(output)
 	}
 
 	s.mu.Lock()
@@ -756,34 +621,24 @@ func (s *daemonServer) handleSessionPrompt(w http.ResponseWriter, r *http.Reques
 	s.totalSteps += len(result.Steps)
 	s.mu.Unlock()
 
-	// Persist usage and model so the console can display them after a browser refresh
-	s.sessions.UpdateUsage(sessionId, result.TotalUsage, usedModel, result.Steps)
-
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(promptResponse{Output: output, Model: usedModel})
 }
 
-// ── Session-scoped streaming prompt with full FEP ──
+// ── Streaming prompt with full FEP ──
 
-func (s *daemonServer) handleSessionPromptStream(w http.ResponseWriter, r *http.Request) {
-	sessionId := r.PathValue("id")
-	sess, ok := s.sessions.Get(sessionId)
-	if !ok {
-		http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
-		return
-	}
-
+func (s *daemonServer) handlePromptStream(w http.ResponseWriter, r *http.Request) {
 	var req promptRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Prompt == "" {
 		http.Error(w, `{"error":"prompt is required"}`, http.StatusBadRequest)
 		return
 	}
 
-	sc := s.getOrCreateSessionCtx(sessionId)
+	sc := s.convCtx
 	sc.mu.Lock()
 	if sc.busy {
 		sc.mu.Unlock()
-		http.Error(w, `{"error":"session is busy"}`, http.StatusTooManyRequests)
+		http.Error(w, `{"error":"agent is busy"}`, http.StatusTooManyRequests)
 		return
 	}
 	sc.busy = true
@@ -810,11 +665,10 @@ func (s *daemonServer) handleSessionPromptStream(w http.ResponseWriter, r *http.
 
 	emit := newFEPEmitter(w)
 
-	// Store the emitter and sessionId on the session context so permission/question
+	// Store the emitter on the conversation context so permission/question
 	// gates can emit FEP events through the active SSE stream.
 	sc.mu.Lock()
 	sc.emitter = emit
-	sc.sessionId = sessionId
 	sc.mu.Unlock()
 	defer func() {
 		sc.mu.Lock()
@@ -822,23 +676,29 @@ func (s *daemonServer) handleSessionPromptStream(w http.ResponseWriter, r *http.
 		sc.mu.Unlock()
 	}()
 
-	// Inject sessionId into Go context so tools (permission gate, question tool) can read it.
-	ctx = context.WithValue(ctx, sessionIdContextKey{}, sessionId)
+	// Inject agent name into Go context so tools (permission gate, question tool) can read it.
+	ctx = context.WithValue(ctx, agentContextKey{}, s.agentName)
 
-	// Get conversation history for this session
-	messages := s.sessions.GetMessages(sessionId)
+	// Get messages from working memory (bounded sliding window)
+	messages := s.memory.Messages()
 
-	// Fire title generation immediately (background goroutine, doesn't block)
-	if sess.MessageCount == 0 {
-		s.generateTitle(sessionId, req.Prompt)
+	// Fetch Engram context (short-term + long-term memories) and prepend
+	effectivePrompt := req.Prompt
+	if s.engram != nil {
+		contextLimit := 5
+		if s.cfg.Memory != nil && s.cfg.Memory.ContextLimit > 0 {
+			contextLimit = s.cfg.Memory.ContextLimit
+		}
+		if engramCtx := s.engram.FetchContext(contextLimit); engramCtx != "" {
+			effectivePrompt = engramCtx + effectivePrompt
+		}
 	}
 
-	// Build the effective prompt: prepend resource context if provided (Option B)
-	effectivePrompt := req.Prompt
+	// Prepend resource context if provided
 	if len(req.Context) > 0 {
 		contextPrefix := formatResourceContext(req.Context)
-		effectivePrompt = contextPrefix + req.Prompt
-		slog.Info("resource context injected (stream)", "session", sessionId, "items", len(req.Context))
+		effectivePrompt = contextPrefix + effectivePrompt
+		slog.Info("resource context injected (stream)", "items", len(req.Context))
 	}
 
 	// Step counter (shared across callbacks)
@@ -846,7 +706,7 @@ func (s *daemonServer) handleSessionPromptStream(w http.ResponseWriter, r *http.
 	var stepMu sync.Mutex
 
 	// Emit agent start
-	emit.emitAgentStart(sessionId, req.Prompt)
+	emit.emitAgentStart(s.agentName, req.Prompt)
 
 	result, usedModel, err := streamWithFallback(ctx, s.cfg, s.bundle, fantasy.AgentStreamCall{
 		Prompt:   effectivePrompt,
@@ -870,12 +730,12 @@ func (s *daemonServer) handleSessionPromptStream(w http.ResponseWriter, r *http.
 			stepCount = stepNumber
 			stepMu.Unlock()
 
-			emit.emitStepStart(stepNumber, sessionId)
+			emit.emitStepStart(stepNumber, s.agentName)
 
 			// Inject steer message if pending
 			if msg := sc.popSteerMessage(); msg != "" {
-				s.sessions.AppendMessages(sessionId, fantasy.NewUserMessage("[STEER] "+msg))
-				slog.Info("steer message injected", "session", sessionId, "message", truncate(msg, 100))
+				s.memory.Append(fantasy.NewUserMessage("[STEER] " + msg))
+				slog.Info("steer message injected", "message", truncate(msg, 100))
 			}
 
 			return nil
@@ -888,7 +748,7 @@ func (s *daemonServer) handleSessionPromptStream(w http.ResponseWriter, r *http.
 
 			toolCallCount := len(sr.Content.ToolCalls())
 
-			emit.emitStepFinish(currentStep, sessionId, sr.Usage, sr.FinishReason, toolCallCount)
+			emit.emitStepFinish(currentStep, s.agentName, sr.Usage, sr.FinishReason, toolCallCount)
 			return nil
 		},
 
@@ -992,18 +852,19 @@ func (s *daemonServer) handleSessionPromptStream(w http.ResponseWriter, r *http.
 		// ── Error ──
 
 		OnError: func(err error) {
-			emit.emitAgentError(sessionId, err, isRetryableError(err))
+			emit.emitAgentError(s.agentName, err, isRetryableError(err))
 		},
 	})
 
 	if err != nil {
-		emit.emitAgentError(sessionId, err, isRetryableError(err))
+		emit.emitAgentError(s.agentName, err, isRetryableError(err))
 	} else {
-		// Persist conversation history (use original prompt, not enriched)
-		s.sessions.AppendMessages(sessionId, fantasy.NewUserMessage(req.Prompt))
+		// Append to working memory (sliding window)
+		s.memory.Append(fantasy.NewUserMessage(req.Prompt))
 		for _, step := range result.Steps {
-			s.sessions.AppendMessages(sessionId, step.Messages...)
+			s.memory.Append(step.Messages...)
 		}
+		s.memory.CompleteTurn()
 
 		stepMu.Lock()
 		finalSteps := stepCount
@@ -1015,48 +876,42 @@ func (s *daemonServer) handleSessionPromptStream(w http.ResponseWriter, r *http.
 		s.mu.Unlock()
 
 		// Emit agent finish with total usage
-		emit.emitAgentFinish(sessionId, result.TotalUsage, finalSteps, usedModel)
+		emit.emitAgentFinish(s.agentName, result.TotalUsage, finalSteps, usedModel)
 
-		// Persist usage and model on the session so the console can display them after a browser refresh
-		s.sessions.UpdateUsage(sessionId, result.TotalUsage, usedModel, result.Steps)
+		// Passive capture to Engram (async, fire-and-forget)
+		if s.engram != nil {
+			s.engram.PassiveCapture(result.Response.Content.Text())
+		}
 	}
 
 	// Emit idle
-	emit.emitSessionIdle(sessionId)
+	emit.emitSessionIdle(s.agentName)
 }
 
 // ── Steer handler ──
 
-func (s *daemonServer) handleSessionSteer(w http.ResponseWriter, r *http.Request) {
-	sessionId := r.PathValue("id")
-	if _, ok := s.sessions.Get(sessionId); !ok {
-		http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
-		return
-	}
-
+func (s *daemonServer) handleSteer(w http.ResponseWriter, r *http.Request) {
 	var req steerRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Message == "" {
 		http.Error(w, `{"error":"message is required"}`, http.StatusBadRequest)
 		return
 	}
 
-	sc := s.getOrCreateSessionCtx(sessionId)
+	sc := s.convCtx
 	sc.mu.Lock()
 	sc.steerMsg = req.Message
 	sc.mu.Unlock()
 
-	slog.Info("steer message queued", "session", sessionId, "message", truncate(req.Message, 100))
+	slog.Info("steer message queued", "message", truncate(req.Message, 100))
 
 	w.Header().Set("Content-Type", "application/json")
 	io.WriteString(w, `{"ok":true}`)
 }
 
-// ── Abort handler (per-session) ──
+// ── Abort handler ──
 
-func (s *daemonServer) handleSessionAbort(w http.ResponseWriter, r *http.Request) {
-	sessionId := r.PathValue("id")
-
-	sc := s.getOrCreateSessionCtx(sessionId)
+func (s *daemonServer) handleAbort(w http.ResponseWriter, r *http.Request) {
+	sc := s.convCtx
 	sc.mu.Lock()
 	if sc.cancel != nil {
 		sc.cancel()
@@ -1064,7 +919,7 @@ func (s *daemonServer) handleSessionAbort(w http.ResponseWriter, r *http.Request
 	sc.busy = false
 	sc.mu.Unlock()
 
-	slog.Info("session aborted", "session", sessionId)
+	slog.Info("conversation aborted")
 
 	w.Header().Set("Content-Type", "application/json")
 	io.WriteString(w, `{"ok":true}`)
@@ -1112,41 +967,6 @@ func (s *daemonServer) handleQuestionReply(w http.ResponseWriter, r *http.Reques
 	io.WriteString(w, `{"ok":true}`)
 }
 
-// ── Legacy endpoints (backward compat — create/use default session) ──
-
-const legacySessionID = "__legacy__"
-
-func (s *daemonServer) ensureLegacySession() {
-	if _, ok := s.sessions.Get(legacySessionID); !ok {
-		// Manually create since we need a fixed ID
-		now := time.Now()
-		sess := &Session{
-			ID:        legacySessionID,
-			Title:     "Legacy Session",
-			Messages:  []fantasy.Message{},
-			CreatedAt: now,
-			UpdatedAt: now,
-		}
-		s.sessions.mu.Lock()
-		s.sessions.sessions[legacySessionID] = sess
-		s.sessions.persist(sess)
-		s.sessions.mu.Unlock()
-	}
-}
-
-func (s *daemonServer) handlePromptLegacy(w http.ResponseWriter, r *http.Request) {
-	s.ensureLegacySession()
-	// Rewrite the path value so handleSessionPrompt can read it
-	r.SetPathValue("id", legacySessionID)
-	s.handleSessionPrompt(w, r)
-}
-
-func (s *daemonServer) handlePromptStreamLegacy(w http.ResponseWriter, r *http.Request) {
-	s.ensureLegacySession()
-	r.SetPathValue("id", legacySessionID)
-	s.handleSessionPromptStream(w, r)
-}
-
 // ── Health and status ──
 
 func (s *daemonServer) handleHealthz(w http.ResponseWriter, _ *http.Request) {
@@ -1160,26 +980,19 @@ func (s *daemonServer) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	steps := s.totalSteps
 	s.mu.Unlock()
 
-	// Count busy sessions
-	busySessions := 0
-	s.mu.Lock()
-	for _, sc := range s.sessionCtx {
-		sc.mu.Lock()
-		if sc.busy {
-			busySessions++
-		}
-		sc.mu.Unlock()
-	}
-	s.mu.Unlock()
-
-	sessionCount := len(s.sessions.List())
+	sc := s.convCtx
+	sc.mu.Lock()
+	busy := sc.busy
+	sc.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"model":         model,
-		"total_steps":   steps,
-		"sessions":      sessionCount,
-		"busy_sessions": busySessions,
+		"model":          model,
+		"total_steps":    steps,
+		"busy":           busy,
+		"messages":       s.memory.MessageCount(),
+		"turns":          s.memory.TurnCount(),
+		"memory_enabled": s.engram != nil,
 	})
 }
 
