@@ -481,6 +481,9 @@ func runDaemon() error {
 	mux.HandleFunc("PATCH /config/window-size", srv.handleSetWindowSize)
 	mux.HandleFunc("DELETE /working-memory", srv.handleClearWorkingMemory)
 
+	// AI-assisted memory extraction
+	mux.HandleFunc("POST /memory/extract", srv.handleMemoryExtract)
+
 	httpSrv := &http.Server{Addr: fmt.Sprintf(":%d", port), Handler: mux}
 
 	go func() {
@@ -1035,6 +1038,130 @@ func (s *daemonServer) handleClearWorkingMemory(w http.ResponseWriter, r *http.R
 		"window_size": s.memory.WindowSize(),
 		"messages":    s.memory.MessageCount(),
 	})
+}
+
+// ── AI-assisted memory extraction ──
+
+const memoryExtractionSystemPrompt = `You are a memory extraction assistant. Your job is to analyze a conversation between a user and an AI agent, then produce a structured observation suitable for long-term memory storage.
+
+Output ONLY valid JSON with these fields:
+{
+  "type": "<one of: decision, bugfix, discovery, pattern, architecture, config, learning>",
+  "title": "<concise title, max 80 chars>",
+  "content": "<detailed content — what was learned, why it matters, how to apply it. 2-5 sentences.>",
+  "tags": ["<relevant>", "<tags>"]
+}
+
+Guidelines:
+- The "type" should match the nature of the knowledge: use "decision" for choices made, "bugfix" for problems solved, "discovery" for new findings, "pattern" for recurring approaches, "architecture" for structural decisions, "config" for configuration knowledge, "learning" for general lessons.
+- The "title" should be specific and searchable — someone should find this by searching keywords.
+- The "content" should be self-contained: readable without the original conversation. Include the WHY, not just the WHAT.
+- The "tags" should be 2-5 lowercase keywords for categorization.
+- If the user provides a focus hint, prioritize that aspect of the conversation.
+- If the conversation is too short or trivial to extract meaningful knowledge, return: {"type":"learning","title":"No significant knowledge to extract","content":"The conversation did not contain extractable knowledge worth persisting.","tags":["empty"]}`
+
+type memoryExtractRequest struct {
+	Focus string `json:"focus,omitempty"` // optional focus hint from the user
+	Type  string `json:"type,omitempty"`  // optional type hint
+}
+
+type memoryExtractResponse struct {
+	Type    string   `json:"type"`
+	Title   string   `json:"title"`
+	Content string   `json:"content"`
+	Tags    []string `json:"tags"`
+}
+
+func (s *daemonServer) handleMemoryExtract(w http.ResponseWriter, r *http.Request) {
+	var req memoryExtractRequest
+	// Body is optional — extraction works with no hints
+	json.NewDecoder(r.Body).Decode(&req)
+
+	// Get all messages from working memory
+	messages := s.memory.Messages()
+	if len(messages) == 0 {
+		http.Error(w, `{"error":"working memory is empty — nothing to extract from"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Format conversation for the extraction model
+	var convBuf strings.Builder
+	convBuf.WriteString("=== Conversation ===\n\n")
+	for _, msg := range messages {
+		role := string(msg.Role)
+		for _, part := range msg.Content {
+			switch p := part.(type) {
+			case fantasy.TextPart:
+				if p.Text != "" {
+					convBuf.WriteString(fmt.Sprintf("[%s] %s\n\n", role, p.Text))
+				}
+			case fantasy.ToolCallPart:
+				convBuf.WriteString(fmt.Sprintf("[%s] Tool call: %s\n", role, p.ToolName))
+			}
+		}
+	}
+
+	// Build the extraction prompt
+	var prompt strings.Builder
+	prompt.WriteString(convBuf.String())
+	prompt.WriteString("\n=== Task ===\n\n")
+	prompt.WriteString("Extract the most important knowledge from the conversation above into a structured observation.\n")
+	if req.Focus != "" {
+		prompt.WriteString(fmt.Sprintf("\nUser focus: %s\n", req.Focus))
+	}
+	if req.Type != "" {
+		prompt.WriteString(fmt.Sprintf("\nPreferred observation type: %s\n", req.Type))
+	}
+	prompt.WriteString("\nRespond with ONLY the JSON object, no markdown fences or extra text.")
+
+	// Build a lightweight one-shot agent (no tools, custom system prompt)
+	model, err := resolveModel(r.Context(), s.cfg.PrimaryModel, s.bundle.providers, s.cfg.PrimaryProvider)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"model resolution failed: %s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	extractAgent := fantasy.NewAgent(model,
+		fantasy.WithSystemPrompt(memoryExtractionSystemPrompt),
+		fantasy.WithMaxOutputTokens(1024),
+	)
+
+	result, err := extractAgent.Generate(r.Context(), fantasy.AgentCall{
+		Prompt: prompt.String(),
+	})
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"extraction failed: %s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	output := strings.TrimSpace(result.Response.Content.Text())
+
+	// Strip markdown code fences if the model wrapped it
+	output = strings.TrimPrefix(output, "```json")
+	output = strings.TrimPrefix(output, "```")
+	output = strings.TrimSuffix(output, "```")
+	output = strings.TrimSpace(output)
+
+	// Parse the AI output
+	var extracted memoryExtractResponse
+	if err := json.Unmarshal([]byte(output), &extracted); err != nil {
+		// If JSON parse fails, return the raw text so the frontend can still show something
+		slog.Warn("extraction JSON parse failed, returning raw", "output", output, "error", err)
+		extracted = memoryExtractResponse{
+			Type:    "learning",
+			Title:   "Extracted knowledge",
+			Content: output,
+			Tags:    []string{"auto-extracted"},
+		}
+	}
+
+	// Apply type hint if provided and AI didn't override
+	if req.Type != "" && extracted.Type == "" {
+		extracted.Type = req.Type
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(extracted)
 }
 
 // ====================================================================
