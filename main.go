@@ -14,11 +14,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"os"
-	"os/exec"
 	"os/signal"
-	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -120,6 +117,13 @@ func buildAgentBundle(ctx context.Context, cfg *Config, extraTools ...fantasy.Ag
 		}
 		tools = append(tools, gwTools...)
 		allMCPConns = append(allMCPConns, conns...)
+	}
+
+	// Add built-in git tools when a git workspace is configured.
+	// These replace the mcp-git sidecar — pure go-git, no CLI or gateway needed.
+	if os.Getenv("GIT_REPO_URL") != "" {
+		tools = append(tools, gitTools()...)
+		slog.Info("built-in git tools enabled", "count", len(gitTools()))
 	}
 
 	// Wrap with security hooks + output truncation
@@ -1406,170 +1410,6 @@ func runTask() error {
 	writeTaskResult(result)
 
 	return nil
-}
-
-// setupGitWorkspace clones a repo and checks out the feature branch.
-// Called before the agent loop when GIT_REPO_URL is set.
-func setupGitWorkspace(repoURL, branch, baseBranch string) error {
-	repoDir := "/data/repo"
-	token := os.Getenv("GIT_TOKEN")
-
-	// Ensure HOME is writable (container may run as root with HOME=/)
-	home, _ := os.UserHomeDir()
-	if home == "" || home == "/" {
-		home = "/data"
-		os.Setenv("HOME", home)
-	}
-
-	// Prevent git from trying to prompt for credentials interactively
-	os.Setenv("GIT_TERMINAL_PROMPT", "0")
-
-	// Embed token in the clone URL for reliable HTTPS auth in headless containers.
-	// The .netrc approach can fail when HOME isn't properly resolved by git.
-	cloneURL := repoURL
-	if token != "" {
-		if u, err := url.Parse(repoURL); err == nil && u.Scheme == "https" {
-			u.User = url.UserPassword("oauth2", token)
-			cloneURL = u.String()
-		}
-	}
-
-	// Configure git credential helper if we have a token (for push/pull later)
-	if token != "" {
-		// Write .netrc for HTTPS auth (works with both GitHub and GitLab)
-		netrcContent := ""
-		for _, host := range []string{"github.com", "gitlab.com"} {
-			netrcContent += fmt.Sprintf("machine %s\nlogin oauth2\npassword %s\n\n", host, token)
-		}
-		// Also handle custom hosts from the URL
-		if u, err := parseHost(repoURL); err == nil && u != "github.com" && u != "gitlab.com" {
-			netrcContent += fmt.Sprintf("machine %s\nlogin oauth2\npassword %s\n\n", u, token)
-		}
-		if err := os.WriteFile(home+"/.netrc", []byte(netrcContent), 0600); err != nil {
-			slog.Warn("failed to write .netrc", "error", err)
-		}
-	}
-
-	// Configure git user for commits
-	runGit("", "config", "--global", "user.email", "agent@agentops.io")
-	runGit("", "config", "--global", "user.name", "AgentOps Agent")
-
-	// Clone the repo (using token-embedded URL for auth, logged URL is sanitized)
-	slog.Info("cloning git repo", "url", repoURL, "branch", baseBranch)
-	args := []string{"clone", "--depth", "50"}
-	if baseBranch != "" {
-		args = append(args, "-b", baseBranch)
-	}
-	args = append(args, cloneURL, repoDir)
-	if err := runGit("", args...); err != nil {
-		return fmt.Errorf("git clone failed: %w", err)
-	}
-
-	// Replace the remote URL with the clean URL (no embedded token) so that
-	// subsequent push/pull uses .netrc or the git credential helper instead.
-	runGit(repoDir, "remote", "set-url", "origin", repoURL)
-
-	// Fetch the feature branch if it exists on remote
-	if branch != "" && branch != baseBranch {
-		if err := runGit(repoDir, "fetch", "origin", branch+":"+branch); err != nil {
-			// Branch doesn't exist on remote — create it locally
-			slog.Info("creating new branch", "branch", branch)
-			if err := runGit(repoDir, "checkout", "-b", branch); err != nil {
-				return fmt.Errorf("git checkout -b %s failed: %w", branch, err)
-			}
-		} else {
-			// Branch exists — check it out
-			if err := runGit(repoDir, "checkout", branch); err != nil {
-				return fmt.Errorf("git checkout %s failed: %w", branch, err)
-			}
-		}
-	}
-
-	slog.Info("git workspace ready", "dir", repoDir, "branch", branch)
-	return nil
-}
-
-// extractGitInfo reads the git state after the agent completes to report commits and PR URL.
-func extractGitInfo() (commits int, prURL string) {
-	repoDir := "/data/repo"
-	baseBranch := os.Getenv("GIT_BASE_BRANCH")
-	if baseBranch == "" {
-		baseBranch = "main"
-	}
-
-	// Count commits ahead of base
-	out, err := runGitOutput(repoDir, "rev-list", "--count", baseBranch+"..HEAD")
-	if err == nil {
-		fmt.Sscanf(strings.TrimSpace(out), "%d", &commits)
-	}
-
-	// Try to find a PR URL in the git log or recent output
-	// The agent should have created a PR using the MCP tools.
-	// We can't reliably extract it from git alone — the agent output should contain it.
-	// For now, return 0 and empty — the operator can also check GitHub/GitLab API.
-
-	return commits, ""
-}
-
-// runGit executes a git command and returns an error if it fails.
-func runGit(dir string, args ...string) error {
-	cmd := exec.Command("git", args...)
-	if dir != "" {
-		cmd.Dir = dir
-	}
-	cmd.Env = os.Environ()
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		safeArgs := sanitizeGitArgs(args)
-		safeOut := sanitizeURLCredentials(string(out))
-		slog.Error("git command failed", "args", safeArgs, "output", safeOut, "error", err)
-		return fmt.Errorf("git %s: %s", args[0], safeOut)
-	}
-	return nil
-}
-
-// runGitOutput executes a git command and returns stdout.
-func runGitOutput(dir string, args ...string) (string, error) {
-	cmd := exec.Command("git", args...)
-	if dir != "" {
-		cmd.Dir = dir
-	}
-	cmd.Env = os.Environ()
-	out, err := cmd.Output()
-	if err != nil {
-		return "", err
-	}
-	return string(out), nil
-}
-
-// sanitizeGitArgs redacts credentials from git command args (e.g., URL-embedded tokens).
-func sanitizeGitArgs(args []string) []string {
-	safe := make([]string, len(args))
-	for i, arg := range args {
-		if u, err := url.Parse(arg); err == nil && u.User != nil {
-			u.User = url.User("***")
-			safe[i] = u.String()
-		} else {
-			safe[i] = arg
-		}
-	}
-	return safe
-}
-
-// sanitizeURLCredentials replaces URL-embedded credentials in a string.
-func sanitizeURLCredentials(s string) string {
-	// Match https://user:pass@host patterns and redact the credentials
-	re := regexp.MustCompile(`(https?://)([^@]+)@`)
-	return re.ReplaceAllString(s, "${1}***@")
-}
-
-// parseHost extracts the hostname from a URL.
-func parseHost(rawURL string) (string, error) {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return "", err
-	}
-	return u.Hostname(), nil
 }
 
 // writeTaskResult writes the task result to both stdout (for logs) and
