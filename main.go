@@ -367,6 +367,11 @@ func runDaemon() error {
 		convCtx:     &sessionContext{},
 	}
 
+	// Restore working memory from checkpoint if available (crash recovery)
+	if restored := srv.memory.RestoreCheckpoint(); restored > 0 {
+		slog.Info("recovered from checkpoint", "messages", restored)
+	}
+
 	// Initialize permission gate (emits permission_asked via the active SSE emitter)
 	srv.permGate = newPermissionGate(
 		func(id, sessionId, toolName, input, description string) {
@@ -519,6 +524,9 @@ func runDaemon() error {
 	go func() {
 		<-ctx.Done()
 		slog.Info("shutting down...")
+
+		// Save working memory checkpoint to PVC for crash recovery
+		srv.memory.SaveCheckpoint()
 
 		// End Engram session with raw messages — Engram handles summarization
 		if srv.engram != nil {
@@ -1061,6 +1069,7 @@ func (s *daemonServer) handleSetWindowSize(w http.ResponseWriter, r *http.Reques
 
 func (s *daemonServer) handleClearWorkingMemory(w http.ResponseWriter, r *http.Request) {
 	s.memory.Clear()
+	RemoveCheckpoint() // also clear the on-disk checkpoint
 	slog.Info("working memory cleared")
 
 	w.Header().Set("Content-Type", "application/json")
@@ -1411,7 +1420,20 @@ func setupGitWorkspace(repoURL, branch, baseBranch string) error {
 		os.Setenv("HOME", home)
 	}
 
-	// Configure git credential helper if we have a token
+	// Prevent git from trying to prompt for credentials interactively
+	os.Setenv("GIT_TERMINAL_PROMPT", "0")
+
+	// Embed token in the clone URL for reliable HTTPS auth in headless containers.
+	// The .netrc approach can fail when HOME isn't properly resolved by git.
+	cloneURL := repoURL
+	if token != "" {
+		if u, err := url.Parse(repoURL); err == nil && u.Scheme == "https" {
+			u.User = url.UserPassword("oauth2", token)
+			cloneURL = u.String()
+		}
+	}
+
+	// Configure git credential helper if we have a token (for push/pull later)
 	if token != "" {
 		// Write .netrc for HTTPS auth (works with both GitHub and GitLab)
 		netrcContent := ""
@@ -1431,16 +1453,20 @@ func setupGitWorkspace(repoURL, branch, baseBranch string) error {
 	runGit("", "config", "--global", "user.email", "agent@agentops.io")
 	runGit("", "config", "--global", "user.name", "AgentOps Agent")
 
-	// Clone the repo
+	// Clone the repo (using token-embedded URL for auth, logged URL is sanitized)
 	slog.Info("cloning git repo", "url", repoURL, "branch", baseBranch)
 	args := []string{"clone", "--depth", "50"}
 	if baseBranch != "" {
 		args = append(args, "-b", baseBranch)
 	}
-	args = append(args, repoURL, repoDir)
+	args = append(args, cloneURL, repoDir)
 	if err := runGit("", args...); err != nil {
 		return fmt.Errorf("git clone failed: %w", err)
 	}
+
+	// Replace the remote URL with the clean URL (no embedded token) so that
+	// subsequent push/pull uses .netrc or the git credential helper instead.
+	runGit(repoDir, "remote", "set-url", "origin", repoURL)
 
 	// Fetch the feature branch if it exists on remote
 	if branch != "" && branch != baseBranch {
