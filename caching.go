@@ -70,14 +70,16 @@ func prepareStepWithCaching() fantasy.PrepareStepFunction {
 	}
 }
 
-// applyToolCaching sets Anthropic cache_control on all tool definitions.
-// Tool schemas are identical across all API calls, making them ideal
-// cache targets (written once, read on every subsequent call).
+// applyToolCaching sets Anthropic cache_control on the last tool definition.
+// Anthropic allows at most 4 cache breakpoints per request. Marking just the
+// last tool is enough — the API caches everything up to and including that
+// breakpoint, so the entire tools array is cached with a single breakpoint.
 func applyToolCaching(tools []fantasy.AgentTool) {
-	cacheOpts := anthropicCacheOptions()
-	for _, t := range tools {
-		t.SetProviderOptions(cacheOpts)
+	if len(tools) == 0 {
+		return
 	}
+	cacheOpts := anthropicCacheOptions()
+	tools[len(tools)-1].SetProviderOptions(cacheOpts)
 }
 
 // isAnthropicProvider checks if the primary model uses Anthropic.
