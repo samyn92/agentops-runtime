@@ -480,6 +480,7 @@ func runDaemon() error {
 	// Live configuration
 	mux.HandleFunc("PATCH /config/window-size", srv.handleSetWindowSize)
 	mux.HandleFunc("DELETE /working-memory", srv.handleClearWorkingMemory)
+	mux.HandleFunc("GET /working-memory", srv.handleGetWorkingMemory)
 
 	// AI-assisted memory extraction
 	mux.HandleFunc("POST /memory/extract", srv.handleMemoryExtract)
@@ -1038,6 +1039,98 @@ func (s *daemonServer) handleClearWorkingMemory(w http.ResponseWriter, r *http.R
 		"window_size": s.memory.WindowSize(),
 		"messages":    s.memory.MessageCount(),
 	})
+}
+
+// ── Get working memory (serialized for the console frontend) ──
+
+// serializableToolOutput mirrors the frontend RuntimeToolOutput type.
+type serializableToolOutput struct {
+	Type      string `json:"type"`
+	Text      string `json:"text,omitempty"`
+	Error     string `json:"error,omitempty"`
+	Data      string `json:"data,omitempty"`
+	MediaType string `json:"media_type,omitempty"`
+}
+
+// serializablePart mirrors the frontend RuntimeMessagePart type.
+type serializablePart struct {
+	Type             string                  `json:"type"`
+	Text             string                  `json:"text,omitempty"`
+	Filename         string                  `json:"filename,omitempty"`
+	Data             string                  `json:"data,omitempty"`
+	MediaType        string                  `json:"media_type,omitempty"`
+	ToolCallID       string                  `json:"tool_call_id,omitempty"`
+	ToolName         string                  `json:"tool_name,omitempty"`
+	Input            string                  `json:"input,omitempty"`
+	ProviderExecuted bool                    `json:"provider_executed,omitempty"`
+	Output           *serializableToolOutput `json:"output,omitempty"`
+}
+
+// serializableMessage mirrors the frontend RuntimeMessage type.
+type serializableMessage struct {
+	Role    string             `json:"role"`
+	Content []serializablePart `json:"content"`
+}
+
+func (s *daemonServer) handleGetWorkingMemory(w http.ResponseWriter, r *http.Request) {
+	messages := s.memory.Messages()
+
+	result := make([]serializableMessage, 0, len(messages))
+	for _, msg := range messages {
+		sm := serializableMessage{
+			Role:    string(msg.Role),
+			Content: make([]serializablePart, 0, len(msg.Content)),
+		}
+		for _, part := range msg.Content {
+			switch p := part.(type) {
+			case fantasy.TextPart:
+				sm.Content = append(sm.Content, serializablePart{
+					Type: "text",
+					Text: p.Text,
+				})
+			case fantasy.ReasoningPart:
+				sm.Content = append(sm.Content, serializablePart{
+					Type: "reasoning",
+					Text: p.Text,
+				})
+			case fantasy.FilePart:
+				sm.Content = append(sm.Content, serializablePart{
+					Type:      "file",
+					Filename:  p.Filename,
+					Data:      string(p.Data),
+					MediaType: p.MediaType,
+				})
+			case fantasy.ToolCallPart:
+				sm.Content = append(sm.Content, serializablePart{
+					Type:             "tool-call",
+					ToolCallID:       p.ToolCallID,
+					ToolName:         p.ToolName,
+					Input:            p.Input,
+					ProviderExecuted: p.ProviderExecuted,
+				})
+			case fantasy.ToolResultPart:
+				sp := serializablePart{
+					Type:       "tool-result",
+					ToolCallID: p.ToolCallID,
+				}
+				switch v := p.Output.(type) {
+				case fantasy.ToolResultOutputContentText:
+					sp.Output = &serializableToolOutput{Type: "text", Text: v.Text}
+				case fantasy.ToolResultOutputContentError:
+					sp.Output = &serializableToolOutput{Type: "error", Error: v.Error.Error()}
+				case fantasy.ToolResultOutputContentMedia:
+					sp.Output = &serializableToolOutput{Type: "media", Data: v.Data, MediaType: v.MediaType, Text: v.Text}
+				}
+				sm.Content = append(sm.Content, sp)
+			default:
+				sm.Content = append(sm.Content, serializablePart{Type: "unknown"})
+			}
+		}
+		result = append(result, sm)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
 }
 
 // ── AI-assisted memory extraction ──
