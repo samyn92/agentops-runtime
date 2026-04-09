@@ -25,12 +25,19 @@ const (
 	apiGroup       = "agents.agentops.io"
 	apiVersion     = "v1alpha1"
 	agentRunPlural = "agentruns"
+	agentPlural    = "agents"
 )
 
 var agentRunGVR = schema.GroupVersionResource{
 	Group:    apiGroup,
 	Version:  apiVersion,
 	Resource: agentRunPlural,
+}
+
+var agentGVR = schema.GroupVersionResource{
+	Group:    apiGroup,
+	Version:  apiVersion,
+	Resource: agentPlural,
 }
 
 // K8sClient provides operations for AgentRun CRs.
@@ -60,6 +67,43 @@ func NewK8sClient() (*K8sClient, error) {
 		client:    dynClient,
 		namespace: ns,
 	}, nil
+}
+
+// AgentInfo holds basic info about an Agent CR.
+type AgentInfo struct {
+	Name  string `json:"name"`
+	Mode  string `json:"mode"`
+	Phase string `json:"phase"`
+}
+
+// GetAgent checks if an Agent CR exists and returns basic info.
+func (k *K8sClient) GetAgent(ctx context.Context, name string) (*AgentInfo, error) {
+	obj, err := k.client.Resource(agentGVR).Namespace(k.namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	mode, _, _ := unstructured.NestedString(obj.Object, "spec", "mode")
+	phase, _, _ := unstructured.NestedString(obj.Object, "status", "phase")
+
+	return &AgentInfo{Name: name, Mode: mode, Phase: phase}, nil
+}
+
+// ListAgents returns all Agent CRs in the namespace.
+func (k *K8sClient) ListAgents(ctx context.Context) ([]AgentInfo, error) {
+	list, err := k.client.Resource(agentGVR).Namespace(k.namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	agents := make([]AgentInfo, 0, len(list.Items))
+	for _, item := range list.Items {
+		name := item.GetName()
+		mode, _, _ := unstructured.NestedString(item.Object, "spec", "mode")
+		phase, _, _ := unstructured.NestedString(item.Object, "status", "phase")
+		agents = append(agents, AgentInfo{Name: name, Mode: mode, Phase: phase})
+	}
+	return agents, nil
 }
 
 // AgentRunResult holds the result of creating an AgentRun.

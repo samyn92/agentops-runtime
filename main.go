@@ -1275,14 +1275,14 @@ func runTask() error {
 	prompt := os.Getenv("AGENT_PROMPT")
 	if prompt == "" {
 		result := taskResult{Success: false, Error: "AGENT_PROMPT environment variable is not set"}
-		json.NewEncoder(os.Stdout).Encode(result)
+		writeTaskResult(result)
 		return fmt.Errorf("AGENT_PROMPT not set")
 	}
 
 	cfg, err := loadConfig()
 	if err != nil {
 		result := taskResult{Success: false, Error: err.Error()}
-		json.NewEncoder(os.Stdout).Encode(result)
+		writeTaskResult(result)
 		return err
 	}
 
@@ -1312,7 +1312,7 @@ func runTask() error {
 	bundle, err := buildAgentBundle(ctx, cfg, buildMemoryTools(engram)...)
 	if err != nil {
 		result := taskResult{Success: false, Error: err.Error(), Model: cfg.PrimaryModel}
-		json.NewEncoder(os.Stdout).Encode(result)
+		writeTaskResult(result)
 		return err
 	}
 	defer shutdownMCPConnections(bundle.mcpConns)
@@ -1320,7 +1320,7 @@ func runTask() error {
 	agentResult, usedModel, err := generateWithFallback(ctx, cfg, bundle, fantasy.AgentCall{Prompt: prompt})
 	if err != nil {
 		result := taskResult{Success: false, Error: err.Error(), Model: cfg.PrimaryModel}
-		json.NewEncoder(os.Stdout).Encode(result)
+		writeTaskResult(result)
 		return err
 	}
 
@@ -1331,8 +1331,18 @@ func runTask() error {
 		Model:   usedModel,
 		Success: true,
 	}
-	json.NewEncoder(os.Stdout).Encode(result)
+	writeTaskResult(result)
+
 	return nil
+}
+
+// writeTaskResult writes the task result to both stdout (for logs) and
+// /dev/termination-log (so the operator can read it from pod status).
+func writeTaskResult(result taskResult) {
+	json.NewEncoder(os.Stdout).Encode(result)
+	if data, err := json.Marshal(result); err == nil {
+		os.WriteFile("/dev/termination-log", data, 0644)
+	}
 }
 
 // ====================================================================
@@ -1346,21 +1356,62 @@ type runAgentInput struct {
 
 func newRunAgentTool(k8s *K8sClient) fantasy.AgentTool {
 	return fantasy.NewAgentTool("run_agent",
-		"Trigger another agent with a prompt. Creates an AgentRun CR tracked by the operator.",
+		"Trigger another agent with a prompt. Creates an AgentRun CR tracked by the operator. Use get_agent_run to poll for completion.",
 		func(ctx context.Context, input runAgentInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			if input.Agent == "" || input.Prompt == "" {
 				return fantasy.NewTextErrorResponse("agent and prompt are required"), nil
 			}
+
+			// Prevent self-invocation (daemon agents can't handle concurrent prompts)
 			agentName := os.Getenv("AGENT_NAME")
 			if agentName == "" {
 				agentName = "unknown"
 			}
+			if input.Agent == agentName {
+				return fantasy.NewTextErrorResponse(fmt.Sprintf(
+					"Cannot run_agent on yourself (%q). Use run_agent to trigger a different agent (typically a task-mode agent).", agentName)), nil
+			}
+
+			// Validate target agent exists before creating the AgentRun CR
+			agentInfo, err := k8s.GetAgent(ctx, input.Agent)
+			if err != nil {
+				// Agent not found — list available agents to help the LLM
+				available, listErr := k8s.ListAgents(ctx)
+				if listErr != nil || len(available) == 0 {
+					return fantasy.NewTextErrorResponse(fmt.Sprintf(
+						"Agent %q not found. Could not list available agents.", input.Agent)), nil
+				}
+				var agentList string
+				for _, a := range available {
+					if a.Name != agentName { // exclude self
+						agentList += fmt.Sprintf("\n  - %s (mode: %s, phase: %s)", a.Name, a.Mode, a.Phase)
+					}
+				}
+				if agentList == "" {
+					return fantasy.NewTextErrorResponse(fmt.Sprintf(
+						"Agent %q not found. No other agents are available to run.", input.Agent)), nil
+				}
+				return fantasy.NewTextErrorResponse(fmt.Sprintf(
+					"Agent %q not found. Available agents:%s", input.Agent, agentList)), nil
+			}
+
+			// Warn if targeting a daemon (will use HTTP prompt, not spawn a Job)
+			if agentInfo.Mode == "daemon" && agentInfo.Phase != "Running" {
+				return fantasy.NewTextErrorResponse(fmt.Sprintf(
+					"Agent %q is a daemon in phase %q (not Running). Wait for it to be Running first.", input.Agent, agentInfo.Phase)), nil
+			}
+
 			run, err := k8s.CreateAgentRun(ctx, input.Agent, input.Prompt, "agent", agentName)
 			if err != nil {
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("Failed to create AgentRun: %s", err)), nil
 			}
 
-			resp := fantasy.NewTextResponse(fmt.Sprintf("AgentRun %s created for agent %q", run.Name, input.Agent))
+			modeHint := ""
+			if agentInfo.Mode == "task" {
+				modeHint = " A task pod will be created to execute this."
+			}
+
+			resp := fantasy.NewTextResponse(fmt.Sprintf("AgentRun %s created for agent %q.%s Use get_agent_run with name=%q to check progress.", run.Name, input.Agent, modeHint, run.Name))
 			resp = fantasy.WithResponseMetadata(resp, map[string]any{
 				"ui":        "agent-run",
 				"agent":     input.Agent,
@@ -1385,7 +1436,7 @@ type getAgentRunInput struct {
 
 func newGetAgentRunTool(k8s *K8sClient) fantasy.AgentTool {
 	return fantasy.NewAgentTool("get_agent_run",
-		"Check the status and output of an AgentRun.",
+		"Check the status and output of an AgentRun. Returns phase, output, model, and tool call count.",
 		func(ctx context.Context, input getAgentRunInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			if input.Name == "" {
 				return fantasy.NewTextErrorResponse("name is required"), nil
@@ -1395,7 +1446,24 @@ func newGetAgentRunTool(k8s *K8sClient) fantasy.AgentTool {
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("Failed to get AgentRun: %s", err)), nil
 			}
 
-			resp := fantasy.NewTextResponse(fmt.Sprintf("Phase: %s\nOutput: %s", status.Phase, status.Output))
+			// Build a rich text response
+			text := fmt.Sprintf("Phase: %s", status.Phase)
+			if status.Model != "" {
+				text += fmt.Sprintf("\nModel: %s", status.Model)
+			}
+			if status.ToolCalls > 0 {
+				text += fmt.Sprintf("\nTool calls: %d", status.ToolCalls)
+			}
+			if status.Output != "" {
+				text += fmt.Sprintf("\nOutput: %s", status.Output)
+			}
+
+			// Hint if still running
+			if status.Phase == "Running" || status.Phase == "Pending" || status.Phase == "Queued" || status.Phase == "Unknown" {
+				text += "\n\n(Run is still in progress. Call get_agent_run again to check for completion.)"
+			}
+
+			resp := fantasy.NewTextResponse(text)
 			resp = fantasy.WithResponseMetadata(resp, map[string]any{
 				"ui":     "agent-run-status",
 				"name":   input.Name,
