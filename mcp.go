@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -90,21 +91,28 @@ func loadOCITools(ctx context.Context, toolRefs []ToolEntry) ([]fantasy.AgentToo
 }
 
 // loadGatewayMCPTools connects to MCP gateway sidecars and discovers tools.
+// Retries with backoff to handle sidecar startup race conditions.
 func loadGatewayMCPTools(ctx context.Context, mcpServers []MCPEntry) ([]fantasy.AgentTool, []mcpConnection, error) {
 	var tools []fantasy.AgentTool
 	var conns []mcpConnection
 
 	for _, srv := range mcpServers {
-		sseURL := fmt.Sprintf("http://localhost:%d/sse", srv.Port)
+		mcpURL := fmt.Sprintf("http://localhost:%d/mcp", srv.Port)
 
-		conn, err := startSSEMCP(ctx, srv.Name, sseURL)
+		// Wait for the gateway to be ready before connecting.
+		if err := waitForGateway(ctx, srv.Port, 15*time.Second); err != nil {
+			slog.Error("MCP gateway not ready, skipping", "server", srv.Name, "port", srv.Port, "error", err)
+			continue
+		}
+
+		conn, err := startStreamableMCP(ctx, srv.Name, mcpURL)
 		if err != nil {
 			slog.Error("failed to connect to MCP gateway", "server", srv.Name, "error", err)
 			continue
 		}
 		conns = append(conns, *conn)
 
-		mcpTools, err := discoverMCPTools(ctx, conn.session, srv.Name, "sse", srv.UIHint)
+		mcpTools, err := discoverMCPTools(ctx, conn.session, srv.Name, "streamable", srv.UIHint)
 		if err != nil {
 			slog.Error("failed to discover MCP tools from gateway", "server", srv.Name, "error", err)
 			continue
@@ -115,6 +123,36 @@ func loadGatewayMCPTools(ctx context.Context, mcpServers []MCPEntry) ([]fantasy.
 	}
 
 	return tools, conns, nil
+}
+
+// waitForGateway polls the gateway health endpoint until it responds or timeout.
+func waitForGateway(ctx context.Context, port int, timeout time.Duration) error {
+	healthURL := fmt.Sprintf("http://localhost:%d/health", port)
+	deadline := time.Now().Add(timeout)
+	client := &http.Client{Timeout: 2 * time.Second}
+	attempt := 0
+
+	for time.Now().Before(deadline) {
+		attempt++
+		req, err := http.NewRequestWithContext(ctx, "GET", healthURL, nil)
+		if err != nil {
+			return err
+		}
+		resp, err := client.Do(req)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				slog.Info("MCP gateway ready", "port", port, "attempts", attempt)
+				return nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+	return fmt.Errorf("gateway on port %d not ready after %s", port, timeout)
 }
 
 // startStdioMCP starts an MCP server process and connects via stdio.
@@ -138,19 +176,22 @@ func startStdioMCP(ctx context.Context, name, binPath string) (*mcpConnection, e
 	}, nil
 }
 
-// startSSEMCP connects to an MCP server via SSE transport.
-func startSSEMCP(ctx context.Context, name, sseURL string) (*mcpConnection, error) {
+// startStreamableMCP connects to an MCP server via Streamable HTTP transport.
+func startStreamableMCP(ctx context.Context, name, mcpURL string) (*mcpConnection, error) {
 	impl := &mcp.Implementation{Name: "agentops-fantasy", Version: "0.1.0"}
 	client := mcp.NewClient(impl, nil)
 
-	transport := &mcp.SSEClientTransport{Endpoint: sseURL}
+	transport := &mcp.StreamableClientTransport{
+		Endpoint:             mcpURL,
+		DisableStandaloneSSE: true, // we only need request/response, no server-initiated messages
+	}
 
 	session, err := client.Connect(ctx, transport, nil)
 	if err != nil {
-		return nil, fmt.Errorf("connect to SSE MCP server: %w", err)
+		return nil, fmt.Errorf("connect to MCP gateway: %w", err)
 	}
 
-	slog.Info("connected to MCP SSE server", "name", name, "url", sseURL)
+	slog.Info("connected to MCP gateway", "name", name, "url", mcpURL)
 	return &mcpConnection{
 		session: session,
 		cleanup: func() { session.Close() },
@@ -176,7 +217,7 @@ type mcpToolAdapter struct {
 	session    *mcp.ClientSession
 	serverName string
 	mcpTool    *mcp.Tool
-	transport  string // "stdio" (OCI/inline) or "sse" (gateway/CRD)
+	transport  string // "stdio" (OCI/inline) or "streamable" (gateway/CRD)
 	crdUIHint  string // UI hint from the AgentTool CRD (overrides heuristic detection)
 	opts       fantasy.ProviderOptions
 }
