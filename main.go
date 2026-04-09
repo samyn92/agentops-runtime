@@ -14,7 +14,9 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"sync"
@@ -1262,11 +1264,14 @@ func (s *daemonServer) handleMemoryExtract(w http.ResponseWriter, r *http.Reques
 // ====================================================================
 
 type taskResult struct {
-	Output  string `json:"output"`
-	Steps   int    `json:"steps"`
-	Model   string `json:"model"`
-	Success bool   `json:"success"`
-	Error   string `json:"error,omitempty"`
+	Output         string `json:"output"`
+	Steps          int    `json:"steps"`
+	Model          string `json:"model"`
+	Success        bool   `json:"success"`
+	Error          string `json:"error,omitempty"`
+	PullRequestURL string `json:"pullRequestURL,omitempty"`
+	Commits        int    `json:"commits,omitempty"`
+	Branch         string `json:"branch,omitempty"`
 }
 
 func runTask() error {
@@ -1284,6 +1289,16 @@ func runTask() error {
 		result := taskResult{Success: false, Error: err.Error()}
 		writeTaskResult(result)
 		return err
+	}
+
+	// Set up git workspace if GIT_REPO_URL is set (injected by operator for spec.git runs)
+	gitBranch := os.Getenv("GIT_BRANCH")
+	if repoURL := os.Getenv("GIT_REPO_URL"); repoURL != "" {
+		if err := setupGitWorkspace(repoURL, gitBranch, os.Getenv("GIT_BASE_BRANCH")); err != nil {
+			result := taskResult{Success: false, Error: fmt.Sprintf("git workspace setup failed: %v", err), Branch: gitBranch}
+			writeTaskResult(result)
+			return err
+		}
 	}
 
 	slog.Info("running Fantasy task agent",
@@ -1330,10 +1345,138 @@ func runTask() error {
 		Steps:   len(agentResult.Steps),
 		Model:   usedModel,
 		Success: true,
+		Branch:  gitBranch,
 	}
+
+	// Extract git info from the agent's output if this was a git workspace run
+	if os.Getenv("GIT_REPO_URL") != "" {
+		result.Commits, result.PullRequestURL = extractGitInfo()
+	}
+
 	writeTaskResult(result)
 
 	return nil
+}
+
+// setupGitWorkspace clones a repo and checks out the feature branch.
+// Called before the agent loop when GIT_REPO_URL is set.
+func setupGitWorkspace(repoURL, branch, baseBranch string) error {
+	repoDir := "/data/repo"
+	token := os.Getenv("GIT_TOKEN")
+
+	// Configure git credential helper if we have a token
+	if token != "" {
+		// Write .netrc for HTTPS auth (works with both GitHub and GitLab)
+		netrcContent := ""
+		for _, host := range []string{"github.com", "gitlab.com"} {
+			netrcContent += fmt.Sprintf("machine %s\nlogin oauth2\npassword %s\n\n", host, token)
+		}
+		// Also handle custom hosts from the URL
+		if u, err := parseHost(repoURL); err == nil && u != "github.com" && u != "gitlab.com" {
+			netrcContent += fmt.Sprintf("machine %s\nlogin oauth2\npassword %s\n\n", u, token)
+		}
+		home, _ := os.UserHomeDir()
+		if home == "" {
+			home = "/tmp"
+		}
+		if err := os.WriteFile(home+"/.netrc", []byte(netrcContent), 0600); err != nil {
+			slog.Warn("failed to write .netrc", "error", err)
+		}
+	}
+
+	// Configure git user for commits
+	runGit("", "config", "--global", "user.email", "agent@agentops.io")
+	runGit("", "config", "--global", "user.name", "AgentOps Agent")
+
+	// Clone the repo
+	slog.Info("cloning git repo", "url", repoURL, "branch", baseBranch)
+	args := []string{"clone", "--depth", "50"}
+	if baseBranch != "" {
+		args = append(args, "-b", baseBranch)
+	}
+	args = append(args, repoURL, repoDir)
+	if err := runGit("", args...); err != nil {
+		return fmt.Errorf("git clone failed: %w", err)
+	}
+
+	// Fetch the feature branch if it exists on remote
+	if branch != "" && branch != baseBranch {
+		if err := runGit(repoDir, "fetch", "origin", branch+":"+branch); err != nil {
+			// Branch doesn't exist on remote — create it locally
+			slog.Info("creating new branch", "branch", branch)
+			if err := runGit(repoDir, "checkout", "-b", branch); err != nil {
+				return fmt.Errorf("git checkout -b %s failed: %w", branch, err)
+			}
+		} else {
+			// Branch exists — check it out
+			if err := runGit(repoDir, "checkout", branch); err != nil {
+				return fmt.Errorf("git checkout %s failed: %w", branch, err)
+			}
+		}
+	}
+
+	slog.Info("git workspace ready", "dir", repoDir, "branch", branch)
+	return nil
+}
+
+// extractGitInfo reads the git state after the agent completes to report commits and PR URL.
+func extractGitInfo() (commits int, prURL string) {
+	repoDir := "/data/repo"
+	baseBranch := os.Getenv("GIT_BASE_BRANCH")
+	if baseBranch == "" {
+		baseBranch = "main"
+	}
+
+	// Count commits ahead of base
+	out, err := runGitOutput(repoDir, "rev-list", "--count", baseBranch+"..HEAD")
+	if err == nil {
+		fmt.Sscanf(strings.TrimSpace(out), "%d", &commits)
+	}
+
+	// Try to find a PR URL in the git log or recent output
+	// The agent should have created a PR using the MCP tools.
+	// We can't reliably extract it from git alone — the agent output should contain it.
+	// For now, return 0 and empty — the operator can also check GitHub/GitLab API.
+
+	return commits, ""
+}
+
+// runGit executes a git command and returns an error if it fails.
+func runGit(dir string, args ...string) error {
+	cmd := exec.Command("git", args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	cmd.Env = os.Environ()
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		slog.Error("git command failed", "args", args, "output", string(out), "error", err)
+		return fmt.Errorf("git %s: %s", args[0], string(out))
+	}
+	return nil
+}
+
+// runGitOutput executes a git command and returns stdout.
+func runGitOutput(dir string, args ...string) (string, error) {
+	cmd := exec.Command("git", args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	cmd.Env = os.Environ()
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+// parseHost extracts the hostname from a URL.
+func parseHost(rawURL string) (string, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "", err
+	}
+	return u.Hostname(), nil
 }
 
 // writeTaskResult writes the task result to both stdout (for logs) and
@@ -1350,16 +1493,26 @@ func writeTaskResult(result taskResult) {
 // ====================================================================
 
 type runAgentInput struct {
-	Agent  string `json:"agent" description:"Agent name to run"`
-	Prompt string `json:"prompt" description:"Prompt to send to the agent"`
+	Agent         string `json:"agent" description:"Agent name to run"`
+	Prompt        string `json:"prompt" description:"Prompt to send to the agent"`
+	GitResource   string `json:"git_resource,omitempty" description:"AgentResource name for git workspace (github-repo, gitlab-project, or git-repo)"`
+	GitBranch     string `json:"git_branch,omitempty" description:"Feature branch to work on. Created from base branch if it doesn't exist."`
+	GitBaseBranch string `json:"git_base_branch,omitempty" description:"Base branch for PR/MR target (e.g. main). Defaults to repo default."`
 }
 
 func newRunAgentTool(k8s *K8sClient) fantasy.AgentTool {
 	return fantasy.NewAgentTool("run_agent",
-		"Trigger another agent with a prompt. Creates an AgentRun CR tracked by the operator. Use get_agent_run to poll for completion.",
+		"Trigger another agent with a prompt. Creates an AgentRun CR tracked by the operator. Use get_agent_run to poll for completion. Set git_resource + git_branch to give the task agent a git workspace (clone, branch, commit, push, create PR).",
 		func(ctx context.Context, input runAgentInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			if input.Agent == "" || input.Prompt == "" {
 				return fantasy.NewTextErrorResponse("agent and prompt are required"), nil
+			}
+
+			// Validate git params: if any git field is set, resource + branch are required
+			if input.GitResource != "" || input.GitBranch != "" {
+				if input.GitResource == "" || input.GitBranch == "" {
+					return fantasy.NewTextErrorResponse("git_resource and git_branch are both required when using a git workspace"), nil
+				}
 			}
 
 			// Prevent self-invocation (daemon agents can't handle concurrent prompts)
@@ -1401,7 +1554,17 @@ func newRunAgentTool(k8s *K8sClient) fantasy.AgentTool {
 					"Agent %q is a daemon in phase %q (not Running). Wait for it to be Running first.", input.Agent, agentInfo.Phase)), nil
 			}
 
-			run, err := k8s.CreateAgentRun(ctx, input.Agent, input.Prompt, "agent", agentName)
+			// Build optional git params
+			var gitParams *AgentRunGitParams
+			if input.GitResource != "" {
+				gitParams = &AgentRunGitParams{
+					ResourceRef: input.GitResource,
+					Branch:      input.GitBranch,
+					BaseBranch:  input.GitBaseBranch,
+				}
+			}
+
+			run, err := k8s.CreateAgentRun(ctx, input.Agent, input.Prompt, "agent", agentName, gitParams)
 			if err != nil {
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("Failed to create AgentRun: %s", err)), nil
 			}
@@ -1409,6 +1572,9 @@ func newRunAgentTool(k8s *K8sClient) fantasy.AgentTool {
 			modeHint := ""
 			if agentInfo.Mode == "task" {
 				modeHint = " A task pod will be created to execute this."
+			}
+			if gitParams != nil {
+				modeHint += fmt.Sprintf(" Git workspace: resource=%s branch=%s.", gitParams.ResourceRef, gitParams.Branch)
 			}
 
 			resp := fantasy.NewTextResponse(fmt.Sprintf("AgentRun %s created for agent %q.%s Use get_agent_run with name=%q to check progress.", run.Name, input.Agent, modeHint, run.Name))
@@ -1436,7 +1602,7 @@ type getAgentRunInput struct {
 
 func newGetAgentRunTool(k8s *K8sClient) fantasy.AgentTool {
 	return fantasy.NewAgentTool("get_agent_run",
-		"Check the status and output of an AgentRun. Returns phase, output, model, and tool call count.",
+		"Check the status and output of an AgentRun. Returns phase, output, model, tool call count, and git info (PR URL, commits, branch) if applicable.",
 		func(ctx context.Context, input getAgentRunInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			if input.Name == "" {
 				return fantasy.NewTextErrorResponse("name is required"), nil
@@ -1458,18 +1624,37 @@ func newGetAgentRunTool(k8s *K8sClient) fantasy.AgentTool {
 				text += fmt.Sprintf("\nOutput: %s", status.Output)
 			}
 
+			// Git-specific status
+			if status.PullRequestURL != "" {
+				text += fmt.Sprintf("\nPull Request: %s", status.PullRequestURL)
+			}
+			if status.Commits > 0 {
+				text += fmt.Sprintf("\nCommits: %d", status.Commits)
+			}
+			if status.Branch != "" {
+				text += fmt.Sprintf("\nBranch: %s", status.Branch)
+			}
+
 			// Hint if still running
 			if status.Phase == "Running" || status.Phase == "Pending" || status.Phase == "Queued" || status.Phase == "Unknown" {
 				text += "\n\n(Run is still in progress. Call get_agent_run again to check for completion.)"
 			}
 
-			resp := fantasy.NewTextResponse(text)
-			resp = fantasy.WithResponseMetadata(resp, map[string]any{
+			metadata := map[string]any{
 				"ui":     "agent-run-status",
 				"name":   input.Name,
 				"phase":  status.Phase,
 				"output": status.Output,
-			})
+			}
+			if status.PullRequestURL != "" {
+				metadata["pullRequestURL"] = status.PullRequestURL
+			}
+			if status.Branch != "" {
+				metadata["branch"] = status.Branch
+			}
+
+			resp := fantasy.NewTextResponse(text)
+			resp = fantasy.WithResponseMetadata(resp, metadata)
 			return resp, nil
 		})
 }

@@ -111,17 +111,45 @@ type AgentRunResult struct {
 	Name string `json:"name"`
 }
 
-// AgentRunStatus holds the status of an AgentRun.
-type AgentRunStatus struct {
-	Phase     string `json:"phase"`
-	Output    string `json:"output"`
-	ToolCalls int64  `json:"toolCalls"`
-	Model     string `json:"model"`
+// AgentRunGitParams holds optional git workspace params for an AgentRun.
+type AgentRunGitParams struct {
+	ResourceRef string `json:"resourceRef"`
+	Branch      string `json:"branch"`
+	BaseBranch  string `json:"baseBranch,omitempty"`
 }
 
-// CreateAgentRun creates an AgentRun CR.
-func (k *K8sClient) CreateAgentRun(ctx context.Context, agentRef, prompt, source, sourceRef string) (*AgentRunResult, error) {
+// AgentRunStatus holds the status of an AgentRun.
+type AgentRunStatus struct {
+	Phase          string `json:"phase"`
+	Output         string `json:"output"`
+	ToolCalls      int64  `json:"toolCalls"`
+	Model          string `json:"model"`
+	PullRequestURL string `json:"pullRequestURL,omitempty"`
+	Commits        int64  `json:"commits,omitempty"`
+	Branch         string `json:"branch,omitempty"`
+}
+
+// CreateAgentRun creates an AgentRun CR. If gitParams is non-nil, spec.git is populated.
+func (k *K8sClient) CreateAgentRun(ctx context.Context, agentRef, prompt, source, sourceRef string, gitParams *AgentRunGitParams) (*AgentRunResult, error) {
 	name := fmt.Sprintf("%s-run-%d", agentRef, time.Now().UnixMilli())
+
+	spec := map[string]interface{}{
+		"agentRef":  agentRef,
+		"prompt":    prompt,
+		"source":    source,
+		"sourceRef": sourceRef,
+	}
+
+	if gitParams != nil {
+		gitMap := map[string]interface{}{
+			"resourceRef": gitParams.ResourceRef,
+			"branch":      gitParams.Branch,
+		}
+		if gitParams.BaseBranch != "" {
+			gitMap["baseBranch"] = gitParams.BaseBranch
+		}
+		spec["git"] = gitMap
+	}
 
 	obj := &unstructured.Unstructured{
 		Object: map[string]interface{}{
@@ -134,12 +162,7 @@ func (k *K8sClient) CreateAgentRun(ctx context.Context, agentRef, prompt, source
 					"agents.agentops.io/agent": agentRef,
 				},
 			},
-			"spec": map[string]interface{}{
-				"agentRef":  agentRef,
-				"prompt":    prompt,
-				"source":    source,
-				"sourceRef": sourceRef,
-			},
+			"spec": spec,
 		},
 	}
 
