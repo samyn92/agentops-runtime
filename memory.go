@@ -323,6 +323,7 @@ func (ec *EngramClient) SaveObservation(obsType, title, content string, tags []s
 		"type":       obsType,
 		"title":      title,
 		"content":    content,
+		"project":    ec.project,
 	}
 	if len(tags) > 0 {
 		body["tags"] = tags
@@ -348,6 +349,7 @@ func (ec *EngramClient) PassiveCapture(assistantOutput string) {
 	body := map[string]string{
 		"session_id": ec.sessionID,
 		"content":    assistantOutput,
+		"project":    ec.project,
 	}
 
 	go func() {
