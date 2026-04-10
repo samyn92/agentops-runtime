@@ -128,9 +128,6 @@ func buildAgentBundle(ctx context.Context, cfg *Config, extraTools ...fantasy.Ag
 		slog.Info("built-in git tools enabled", "count", len(gitTools()))
 	}
 
-	// Wrap with security hooks + output truncation
-	tools = wrapToolsWithHooks(tools, cfg.ToolHooks, cfg.MaxToolResultChars)
-
 	// Add orchestration tools (run_agent, get_agent_run, list_task_agents)
 	k8sClient, err := NewK8sClient()
 	if err != nil {
@@ -142,6 +139,10 @@ func buildAgentBundle(ctx context.Context, cfg *Config, extraTools ...fantasy.Ag
 
 	// Add any extra tools (e.g. memory tools from Engram)
 	tools = append(tools, extraTools...)
+
+	// Wrap ALL tools with security hooks + output truncation + tracing spans.
+	// This must be done AFTER all tools are added so every tool gets traced.
+	tools = wrapToolsWithHooks(tools, cfg.ToolHooks, cfg.MaxToolResultChars)
 
 	// Apply Anthropic prompt caching to tool definitions (if using Anthropic)
 	if isAnthropicProvider(cfg) {
@@ -485,10 +486,6 @@ func runDaemon() error {
 			gwTools, _, _ := loadGatewayMCPTools(ctx, cfg.MCPServers)
 			tools = append(tools, gwTools...)
 		}
-		tools = wrapToolsWithHooks(tools, cfg.ToolHooks, cfg.MaxToolResultChars)
-
-		// Wrap with permission gates
-		tools = srv.permGate.wrapTools(tools, cfg.PermissionTools)
 
 		// Add orchestration tools
 		k8sClient, _ := NewK8sClient()
@@ -500,6 +497,12 @@ func runDaemon() error {
 		if cfg.EnableQuestionTool {
 			tools = append(tools, newQuestionTool(srv.questionGate))
 		}
+
+		// Wrap ALL tools with hooks (tracing + truncation) BEFORE permission gates
+		tools = wrapToolsWithHooks(tools, cfg.ToolHooks, cfg.MaxToolResultChars)
+
+		// Wrap with permission gates (on top of hook-wrapped tools)
+		tools = srv.permGate.wrapTools(tools, cfg.PermissionTools)
 
 		opts = append(opts, fantasy.WithTools(tools...))
 		if cfg.SystemPrompt != "" {
@@ -536,7 +539,6 @@ func runDaemon() error {
 			gwTools, _, _ := loadGatewayMCPTools(ctx, cfg.MCPServers)
 			tools = append(tools, gwTools...)
 		}
-		tools = wrapToolsWithHooks(tools, cfg.ToolHooks, cfg.MaxToolResultChars)
 
 		k8sClient, _ := NewK8sClient()
 		if k8sClient != nil {
@@ -544,6 +546,9 @@ func runDaemon() error {
 		}
 
 		tools = append(tools, newQuestionTool(srv.questionGate))
+
+		// Wrap ALL tools with hooks (tracing + truncation)
+		tools = wrapToolsWithHooks(tools, cfg.ToolHooks, cfg.MaxToolResultChars)
 
 		opts := []fantasy.AgentOption{fantasy.WithTools(tools...)}
 		if cfg.SystemPrompt != "" {
