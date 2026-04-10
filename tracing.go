@@ -23,6 +23,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
@@ -84,6 +85,7 @@ func initTracing(ctx context.Context, agentName, agentNamespace, agentMode strin
 	)
 
 	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.TraceContext{})
 	tracer = tp.Tracer("agentops-runtime")
 
 	slog.Info("tracing enabled",
@@ -326,4 +328,77 @@ func classifyToolType(toolName string) string {
 	default:
 		return "builtin"
 	}
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Delegation trace context — span links for cross-agent tracing
+// ────────────────────────────────────────────────────────────────────
+
+// Delegation attribute keys — set on the child's root span to identify its parent.
+var (
+	attrDelegationParentTraceID = attribute.Key("delegation.parent_trace_id")
+	attrDelegationParentSpanID  = attribute.Key("delegation.parent_span_id")
+	attrDelegationParentAgent   = attribute.Key("delegation.parent_agent")
+	attrDelegationRunName       = attribute.Key("delegation.run_name")
+)
+
+// traceparentFromContext builds a W3C traceparent header value from the current
+// span context. Returns empty string if there is no valid span context.
+func traceparentFromContext(ctx context.Context) string {
+	carrier := propagation.MapCarrier{}
+	otel.GetTextMapPropagator().Inject(ctx, carrier)
+	return carrier.Get("traceparent")
+}
+
+// spanContextFromTraceparent extracts a remote SpanContext from a W3C traceparent
+// string. Returns an invalid SpanContext if the string is empty or malformed.
+func spanContextFromTraceparent(traceparent string) trace.SpanContext {
+	if traceparent == "" {
+		return trace.SpanContext{}
+	}
+	carrier := propagation.MapCarrier{}
+	carrier.Set("traceparent", traceparent)
+	ctx := otel.GetTextMapPropagator().Extract(context.Background(), carrier)
+	return trace.SpanContextFromContext(ctx)
+}
+
+// delegationSpanOptions returns trace.SpanStartOption values that create a span
+// link to the parent agent's span and set delegation attributes. The child span
+// starts a new independent trace but carries a link back to the parent.
+func delegationSpanOptions(traceparent, parentAgent, runName string) []trace.SpanStartOption {
+	var opts []trace.SpanStartOption
+
+	parentSC := spanContextFromTraceparent(traceparent)
+	if parentSC.IsValid() {
+		// Create a span link to the parent agent's orchestration span.
+		// The child trace stays independent (separate trace ID) but linked.
+		opts = append(opts, trace.WithLinks(trace.Link{
+			SpanContext: parentSC,
+			Attributes: []attribute.KeyValue{
+				attribute.String("link.type", "delegation"),
+				attribute.String("link.parent_agent", parentAgent),
+				attribute.String("link.run_name", runName),
+			},
+		}))
+	}
+
+	// Set delegation attributes on the child's root span for easy querying.
+	attrs := []attribute.KeyValue{}
+	if parentSC.IsValid() {
+		attrs = append(attrs,
+			attrDelegationParentTraceID.String(parentSC.TraceID().String()),
+			attrDelegationParentSpanID.String(parentSC.SpanID().String()),
+		)
+	}
+	if parentAgent != "" {
+		attrs = append(attrs, attrDelegationParentAgent.String(parentAgent))
+	}
+	if runName != "" {
+		attrs = append(attrs, attrDelegationRunName.String(runName))
+	}
+	if len(attrs) > 0 {
+		opts = append(opts, trace.WithAttributes(attrs...))
+	}
+
+	return opts
 }

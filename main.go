@@ -705,13 +705,24 @@ func (s *daemonServer) handlePrompt(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	// Start root tracing span
-	ctx, promptSpan := tracer.Start(ctx, "agent.prompt", trace.WithAttributes(
-		attrAgentName.String(s.agentName),
-		attrAgentMode.String("daemon"),
-		attrGenAIOperationName.String("invoke_agent"),
-		attrGenAIProviderName.String(detectGenAIProvider(s.cfg.PrimaryModel, s.cfg.PrimaryProvider)),
-		attrGenAIRequestModel.String(s.cfg.PrimaryModel),
-	))
+	// If this prompt was triggered by another agent (operator sends traceparent header),
+	// create a span link back to the parent's orchestration span.
+	spanOpts := []trace.SpanStartOption{
+		trace.WithAttributes(
+			attrAgentName.String(s.agentName),
+			attrAgentMode.String("daemon"),
+			attrGenAIOperationName.String("invoke_agent"),
+			attrGenAIProviderName.String(detectGenAIProvider(s.cfg.PrimaryModel, s.cfg.PrimaryProvider)),
+			attrGenAIRequestModel.String(s.cfg.PrimaryModel),
+		),
+	}
+	if tp := r.Header.Get("Traceparent"); tp != "" {
+		parentAgent := r.Header.Get("X-AgentOps-Parent-Agent")
+		runName := r.Header.Get("X-AgentOps-Run-Name")
+		spanOpts = append(spanOpts, delegationSpanOptions(tp, parentAgent, runName)...)
+		slog.Info("delegation trace link created (prompt)", "parentAgent", parentAgent, "runName", runName)
+	}
+	ctx, promptSpan := tracer.Start(ctx, "agent.prompt", spanOpts...)
 	defer promptSpan.End()
 
 	// Record the user prompt as a content event for trace visibility
@@ -825,13 +836,24 @@ func (s *daemonServer) handlePromptStream(w http.ResponseWriter, r *http.Request
 	defer cancel()
 
 	// Start root tracing span for this prompt execution
-	ctx, promptSpan := tracer.Start(ctx, "agent.prompt", trace.WithAttributes(
-		attrAgentName.String(s.agentName),
-		attrAgentMode.String("daemon"),
-		attrGenAIOperationName.String("invoke_agent"),
-		attrGenAIProviderName.String(detectGenAIProvider(s.cfg.PrimaryModel, s.cfg.PrimaryProvider)),
-		attrGenAIRequestModel.String(s.cfg.PrimaryModel),
-	))
+	// If this prompt was triggered by another agent (operator sends traceparent header),
+	// create a span link back to the parent's orchestration span.
+	streamSpanOpts := []trace.SpanStartOption{
+		trace.WithAttributes(
+			attrAgentName.String(s.agentName),
+			attrAgentMode.String("daemon"),
+			attrGenAIOperationName.String("invoke_agent"),
+			attrGenAIProviderName.String(detectGenAIProvider(s.cfg.PrimaryModel, s.cfg.PrimaryProvider)),
+			attrGenAIRequestModel.String(s.cfg.PrimaryModel),
+		),
+	}
+	if tp := r.Header.Get("Traceparent"); tp != "" {
+		parentAgent := r.Header.Get("X-AgentOps-Parent-Agent")
+		runName := r.Header.Get("X-AgentOps-Run-Name")
+		streamSpanOpts = append(streamSpanOpts, delegationSpanOptions(tp, parentAgent, runName)...)
+		slog.Info("delegation trace link created (stream)", "parentAgent", parentAgent, "runName", runName)
+	}
+	ctx, promptSpan := tracer.Start(ctx, "agent.prompt", streamSpanOpts...)
 	defer promptSpan.End()
 
 	// Record the user prompt as a content event for trace visibility
@@ -1541,13 +1563,24 @@ func runTask() error {
 	}()
 
 	// Start root tracing span for this task execution
-	ctx, promptSpan := tracer.Start(ctx, "agent.prompt", trace.WithAttributes(
-		attrAgentName.String(agentName),
-		attrAgentMode.String("task"),
-		attrGenAIOperationName.String("invoke_agent"),
-		attrGenAIProviderName.String(detectGenAIProvider(cfg.PrimaryModel, cfg.PrimaryProvider)),
-		attrGenAIRequestModel.String(cfg.PrimaryModel),
-	))
+	// If this task was spawned by another agent (via run_agent), create a span link
+	// back to the parent's orchestration span for cross-agent trace correlation.
+	spanOpts := []trace.SpanStartOption{
+		trace.WithAttributes(
+			attrAgentName.String(agentName),
+			attrAgentMode.String("task"),
+			attrGenAIOperationName.String("invoke_agent"),
+			attrGenAIProviderName.String(detectGenAIProvider(cfg.PrimaryModel, cfg.PrimaryProvider)),
+			attrGenAIRequestModel.String(cfg.PrimaryModel),
+		),
+	}
+	if tp := os.Getenv("TRACEPARENT"); tp != "" {
+		parentAgent := os.Getenv("AGENT_RUN_SOURCE_AGENT")
+		runName := os.Getenv("AGENT_RUN_NAME")
+		spanOpts = append(spanOpts, delegationSpanOptions(tp, parentAgent, runName)...)
+		slog.Info("delegation trace link created", "parentAgent", parentAgent, "runName", runName)
+	}
+	ctx, promptSpan := tracer.Start(ctx, "agent.prompt", spanOpts...)
 
 	// Record the user prompt as a content event for trace visibility
 	recordPromptEvent(promptSpan, prompt)
@@ -1792,7 +1825,7 @@ func newRunAgentTool(k8s *K8sClient, resources []ResourceEntry) fantasy.AgentToo
 				}
 			}
 
-			run, err := k8s.CreateAgentRun(ctx, input.Agent, input.Prompt, "agent", agentName, gitParams)
+			run, err := k8s.CreateAgentRun(ctx, input.Agent, input.Prompt, "agent", agentName, traceparentFromContext(ctx), gitParams)
 			if err != nil {
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("Failed to create AgentRun: %s", err)), nil
 			}

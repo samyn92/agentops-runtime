@@ -263,7 +263,8 @@ type AgentRunStatus struct {
 }
 
 // CreateAgentRun creates an AgentRun CR. If gitParams is non-nil, spec.git is populated.
-func (k *K8sClient) CreateAgentRun(ctx context.Context, agentRef, prompt, source, sourceRef string, gitParams *AgentRunGitParams) (*AgentRunResult, error) {
+// traceparent is the W3C trace context string from the calling agent's span (may be empty).
+func (k *K8sClient) CreateAgentRun(ctx context.Context, agentRef, prompt, source, sourceRef, traceparent string, gitParams *AgentRunGitParams) (*AgentRunResult, error) {
 	name := fmt.Sprintf("%s-run-%d", agentRef, time.Now().UnixMilli())
 
 	spec := map[string]interface{}{
@@ -284,18 +285,32 @@ func (k *K8sClient) CreateAgentRun(ctx context.Context, agentRef, prompt, source
 		spec["git"] = gitMap
 	}
 
+	// Build annotations for trace context propagation
+	annotations := map[string]interface{}{}
+	if traceparent != "" {
+		annotations["agents.agentops.io/traceparent"] = traceparent
+	}
+	if sourceRef != "" {
+		annotations["agents.agentops.io/parent-agent"] = sourceRef
+	}
+
+	metadata := map[string]interface{}{
+		"name":      name,
+		"namespace": k.namespace,
+		"labels": map[string]interface{}{
+			"agents.agentops.io/agent": agentRef,
+		},
+	}
+	if len(annotations) > 0 {
+		metadata["annotations"] = annotations
+	}
+
 	obj := &unstructured.Unstructured{
 		Object: map[string]interface{}{
 			"apiVersion": fmt.Sprintf("%s/%s", apiGroup, apiVersion),
 			"kind":       "AgentRun",
-			"metadata": map[string]interface{}{
-				"name":      name,
-				"namespace": k.namespace,
-				"labels": map[string]interface{}{
-					"agents.agentops.io/agent": agentRef,
-				},
-			},
-			"spec": spec,
+			"metadata":   metadata,
+			"spec":       spec,
 		},
 	}
 
