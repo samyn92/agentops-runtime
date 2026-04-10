@@ -1830,6 +1830,16 @@ func newRunAgentTool(k8s *K8sClient, resources []ResourceEntry) fantasy.AgentToo
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("Failed to create AgentRun: %s", err)), nil
 			}
 
+			// Set delegation attributes on the current tool.execute span so the
+			// parent trace waterfall can link to the child agent's trace.
+			// The span was created by hookWrappedTool.Run() in hooks.go.
+			currentSpan := trace.SpanFromContext(ctx)
+			currentSpan.SetAttributes(
+				attribute.String("delegation.child_agent", input.Agent),
+				attribute.String("delegation.child_run", run.Name),
+				attribute.String("delegation.child_namespace", os.Getenv("AGENT_NAMESPACE")),
+			)
+
 			modeHint := ""
 			if agentInfo.Mode == "task" {
 				modeHint = " A task pod will be created to execute this."
