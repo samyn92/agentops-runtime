@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"time"
 
 	"charm.land/fantasy"
 	"go.opentelemetry.io/otel"
@@ -77,7 +78,12 @@ func initTracing(ctx context.Context, agentName, agentNamespace, agentMode strin
 	}
 
 	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exporter),
+		sdktrace.WithBatcher(exporter,
+			// Shorter batch timeout for task pods — ensures spans are flushed
+			// before short-lived Jobs exit. Daemon pods benefit too since
+			// spans appear in Tempo faster.
+			sdktrace.WithBatchTimeout(2*time.Second),
+		),
 		sdktrace.WithResource(res),
 		// Always sample — we want every agent execution traced.
 		// Revisit if Tempo storage becomes a concern (per PLAN_otel.md open question #3).

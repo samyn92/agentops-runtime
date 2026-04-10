@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"charm.land/fantasy"
 	"go.opentelemetry.io/otel/attribute"
@@ -1563,7 +1564,14 @@ func runTask() error {
 	}
 	defer func() {
 		if shutdownTracing != nil {
-			shutdownTracing(context.Background())
+			// Give the batch exporter up to 30s to flush all spans to Tempo.
+			// Without a deadline the gRPC export may hang or the process may
+			// exit before all tool/step spans are delivered.
+			flushCtx, flushCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer flushCancel()
+			if err := shutdownTracing(flushCtx); err != nil {
+				slog.Warn("tracing shutdown error", "error", err)
+			}
 		}
 	}()
 
