@@ -62,6 +62,18 @@ func (h *hookWrappedTool) Run(ctx context.Context, call fantasy.ToolCall) (fanta
 
 	// Start a tracing span for this tool execution
 	ctx, span := tracer.Start(ctx, "tool.execute")
+	defer span.End() // BUG FIX: span was never ended before
+
+	// Set tool identity attributes at creation (important for sampling decisions)
+	span.SetAttributes(
+		attrGenAIOperationName.String("execute_tool"),
+		attrToolName.String(toolName),
+		attrToolType.String(classifyToolType(toolName)),
+		attrGenAIToolName.String(toolName),
+	)
+	if call.ID != "" {
+		span.SetAttributes(attrGenAIToolCallID.String(call.ID))
+	}
 
 	// Parse input for inspection
 	var args map[string]any

@@ -223,10 +223,20 @@ func buildFallbackAgent(ctx context.Context, cfg *Config, providers map[string]f
 // Creates a gen_ai.stream span covering the LLM call (including fallback attempts).
 func streamWithFallback(ctx context.Context, cfg *Config, bundle *agentBundle, call fantasy.AgentStreamCall) (*fantasy.AgentResult, string, error) {
 	ctx, span := tracer.Start(ctx, "gen_ai.stream", trace.WithAttributes(
+		attrGenAIOperationName.String("chat"),
+		attrGenAIProviderName.String(detectGenAIProvider(cfg.PrimaryModel, cfg.PrimaryProvider)),
 		attrGenAIRequestModel.String(cfg.PrimaryModel),
 		attrGenAISystem.String(detectGenAISystem(cfg.PrimaryModel, cfg.PrimaryProvider)),
 	))
 	defer span.End()
+
+	// Add optional request parameters
+	if cfg.Temperature != nil {
+		span.SetAttributes(attrGenAITemperature.Float64(*cfg.Temperature))
+	}
+	if cfg.MaxOutputTokens != nil {
+		span.SetAttributes(attrGenAIMaxTokens.Int64(*cfg.MaxOutputTokens))
+	}
 
 	result, err := bundle.agent.Stream(ctx, call)
 	if err == nil {
@@ -276,10 +286,20 @@ func streamWithFallback(ctx context.Context, cfg *Config, bundle *agentBundle, c
 // Creates a gen_ai.generate span covering the LLM call (including fallback attempts).
 func generateWithFallback(ctx context.Context, cfg *Config, bundle *agentBundle, call fantasy.AgentCall) (*fantasy.AgentResult, string, error) {
 	ctx, span := tracer.Start(ctx, "gen_ai.generate", trace.WithAttributes(
+		attrGenAIOperationName.String("chat"),
+		attrGenAIProviderName.String(detectGenAIProvider(cfg.PrimaryModel, cfg.PrimaryProvider)),
 		attrGenAIRequestModel.String(cfg.PrimaryModel),
 		attrGenAISystem.String(detectGenAISystem(cfg.PrimaryModel, cfg.PrimaryProvider)),
 	))
 	defer span.End()
+
+	// Add optional request parameters
+	if cfg.Temperature != nil {
+		span.SetAttributes(attrGenAITemperature.Float64(*cfg.Temperature))
+	}
+	if cfg.MaxOutputTokens != nil {
+		span.SetAttributes(attrGenAIMaxTokens.Int64(*cfg.MaxOutputTokens))
+	}
 
 	result, err := bundle.agent.Generate(ctx, call)
 	if err == nil {
@@ -688,6 +708,9 @@ func (s *daemonServer) handlePrompt(w http.ResponseWriter, r *http.Request) {
 	ctx, promptSpan := tracer.Start(ctx, "agent.prompt", trace.WithAttributes(
 		attrAgentName.String(s.agentName),
 		attrAgentMode.String("daemon"),
+		attrGenAIOperationName.String("invoke_agent"),
+		attrGenAIProviderName.String(detectGenAIProvider(s.cfg.PrimaryModel, s.cfg.PrimaryProvider)),
+		attrGenAIRequestModel.String(s.cfg.PrimaryModel),
 	))
 	defer promptSpan.End()
 
@@ -799,6 +822,9 @@ func (s *daemonServer) handlePromptStream(w http.ResponseWriter, r *http.Request
 	ctx, promptSpan := tracer.Start(ctx, "agent.prompt", trace.WithAttributes(
 		attrAgentName.String(s.agentName),
 		attrAgentMode.String("daemon"),
+		attrGenAIOperationName.String("invoke_agent"),
+		attrGenAIProviderName.String(detectGenAIProvider(s.cfg.PrimaryModel, s.cfg.PrimaryProvider)),
+		attrGenAIRequestModel.String(s.cfg.PrimaryModel),
 	))
 	defer promptSpan.End()
 
@@ -1500,6 +1526,9 @@ func runTask() error {
 	ctx, promptSpan := tracer.Start(ctx, "agent.prompt", trace.WithAttributes(
 		attrAgentName.String(agentName),
 		attrAgentMode.String("task"),
+		attrGenAIOperationName.String("invoke_agent"),
+		attrGenAIProviderName.String(detectGenAIProvider(cfg.PrimaryModel, cfg.PrimaryProvider)),
+		attrGenAIRequestModel.String(cfg.PrimaryModel),
 	))
 
 	// Set up git workspace if GIT_REPO_URL is set (injected by operator for spec.git runs)

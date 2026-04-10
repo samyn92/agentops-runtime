@@ -369,13 +369,19 @@ func (ec *EngramClient) PassiveCapture(ctx context.Context, assistantOutput stri
 	}
 
 	go func() {
-		_, captureCtx := tracer.Start(ctx, "engram.passive_capture")
-		_ = captureCtx // span ends when goroutine finishes
+		captureCtx, captureSpan := tracer.Start(ctx, "engram.passive_capture")
+		captureSpan.SetAttributes(
+			attrEngramOp.String("passive_capture"),
+			attrEngramProject.String(ec.project),
+		)
+		defer captureSpan.End()
 
 		_, err := ec.post("/observations/passive", body)
 		if err != nil {
 			slog.Debug("engram passive capture failed", "error", err)
+			recordError(captureSpan, err)
 		}
+		_ = captureCtx
 	}()
 }
 

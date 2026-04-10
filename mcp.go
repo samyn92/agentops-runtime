@@ -22,6 +22,7 @@ import (
 
 	"charm.land/fantasy"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"go.opentelemetry.io/otel/codes"
 )
 
 // ToolManifest describes how to start an MCP server from an OCI artifact.
@@ -267,9 +268,12 @@ func (m *mcpToolAdapter) Run(ctx context.Context, call fantasy.ToolCall) (fantas
 	defer span.End()
 
 	span.SetAttributes(
+		attrGenAIOperationName.String("execute_tool"),
 		attrToolMCPServer.String(m.serverName),
 		attrToolName.String(m.mcpTool.Name),
+		attrGenAIToolName.String(fmt.Sprintf("mcp_%s_%s", m.serverName, m.mcpTool.Name)),
 		attrToolTransport.String(m.transport),
+		attrToolType.String("mcp"),
 	)
 
 	start := time.Now()
@@ -315,6 +319,7 @@ func (m *mcpToolAdapter) Run(ctx context.Context, call fantasy.ToolCall) (fantas
 
 	if result.IsError {
 		span.SetAttributes(attrToolError.Bool(true))
+		span.SetStatus(codes.Error, "mcp tool returned error")
 		resp := fantasy.NewTextErrorResponse(text)
 		return fantasy.WithResponseMetadata(resp, metadata), nil
 	}

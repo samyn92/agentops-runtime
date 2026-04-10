@@ -108,16 +108,24 @@ var (
 )
 
 // GenAI semantic convention attributes
+// See: https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-spans/
 var (
-	attrGenAISystem          = attribute.Key("gen_ai.system")
+	attrGenAISystem          = attribute.Key("gen_ai.system")         // deprecated alias; use provider.name
+	attrGenAIOperationName   = attribute.Key("gen_ai.operation.name") // Required: "chat", "invoke_agent", "execute_tool"
+	attrGenAIProviderName    = attribute.Key("gen_ai.provider.name")  // Required: "anthropic", "openai", etc.
 	attrGenAIRequestModel    = attribute.Key("gen_ai.request.model")
 	attrGenAIResponseModel   = attribute.Key("gen_ai.response.model")
+	attrGenAIResponseID      = attribute.Key("gen_ai.response.id")
 	attrGenAIInputTokens     = attribute.Key("gen_ai.usage.input_tokens")
 	attrGenAIOutputTokens    = attribute.Key("gen_ai.usage.output_tokens")
 	attrGenAIReasoningTokens = attribute.Key("gen_ai.usage.reasoning_tokens")
 	attrGenAIFinishReason    = attribute.Key("gen_ai.response.finish_reasons")
 	attrGenAICacheCreate     = attribute.Key("gen_ai.usage.cache_creation_tokens")
 	attrGenAICacheRead       = attribute.Key("gen_ai.usage.cache_read_tokens")
+	attrGenAITemperature     = attribute.Key("gen_ai.request.temperature")
+	attrGenAIMaxTokens       = attribute.Key("gen_ai.request.max_tokens")
+	attrGenAIToolName        = attribute.Key("gen_ai.tool.name")
+	attrGenAIToolCallID      = attribute.Key("gen_ai.tool.call.id")
 )
 
 // Step attributes
@@ -168,24 +176,40 @@ func setLLMResultAttributes(span trace.Span, result *fantasy.AgentResult, model 
 	if result == nil {
 		return
 	}
-	span.SetAttributes(
+
+	attrs := []attribute.KeyValue{
 		attrGenAIResponseModel.String(model),
 		attrGenAIInputTokens.Int64(result.TotalUsage.InputTokens),
 		attrGenAIOutputTokens.Int64(result.TotalUsage.OutputTokens),
-	)
+	}
+
 	if result.TotalUsage.ReasoningTokens > 0 {
-		span.SetAttributes(attrGenAIReasoningTokens.Int64(result.TotalUsage.ReasoningTokens))
+		attrs = append(attrs, attrGenAIReasoningTokens.Int64(result.TotalUsage.ReasoningTokens))
 	}
 	if result.TotalUsage.CacheCreationTokens > 0 {
-		span.SetAttributes(attrGenAICacheCreate.Int64(result.TotalUsage.CacheCreationTokens))
+		attrs = append(attrs, attrGenAICacheCreate.Int64(result.TotalUsage.CacheCreationTokens))
 	}
 	if result.TotalUsage.CacheReadTokens > 0 {
-		span.SetAttributes(attrGenAICacheRead.Int64(result.TotalUsage.CacheReadTokens))
+		attrs = append(attrs, attrGenAICacheRead.Int64(result.TotalUsage.CacheReadTokens))
 	}
+
+	// Collect finish reasons from steps
+	var finishReasons []string
+	for _, step := range result.Steps {
+		if r := string(step.FinishReason); r != "" {
+			finishReasons = append(finishReasons, r)
+		}
+	}
+	if len(finishReasons) > 0 {
+		attrs = append(attrs, attrGenAIFinishReason.String(strings.Join(finishReasons, ",")))
+	}
+
+	span.SetAttributes(attrs...)
 }
 
-// detectGenAISystem infers the gen_ai.system value from model/provider names.
-func detectGenAISystem(model, provider string) string {
+// detectGenAIProvider infers the gen_ai.provider.name from model/provider names.
+// Returns the OTel semconv well-known value (e.g. "anthropic", "openai").
+func detectGenAIProvider(model, provider string) string {
 	lower := strings.ToLower(provider)
 	switch {
 	case lower == "anthropic":
@@ -193,7 +217,9 @@ func detectGenAISystem(model, provider string) string {
 	case lower == "openai":
 		return "openai"
 	case lower == "google" || lower == "gemini":
-		return "google"
+		return "gcp.gemini"
+	case lower == "deepseek":
+		return "deepseek"
 	case lower == "openrouter":
 		return "openrouter"
 	}
@@ -205,9 +231,20 @@ func detectGenAISystem(model, provider string) string {
 	case strings.HasPrefix(m, "gpt") || strings.HasPrefix(m, "openai/"):
 		return "openai"
 	case strings.HasPrefix(m, "gemini") || strings.HasPrefix(m, "google/"):
-		return "google"
+		return "gcp.gemini"
+	case strings.HasPrefix(m, "deepseek"):
+		return "deepseek"
 	}
-	return provider
+	if provider != "" {
+		return provider
+	}
+	return "unknown"
+}
+
+// detectGenAISystem is a backward-compatible alias for detectGenAIProvider.
+// Deprecated: use detectGenAIProvider instead.
+func detectGenAISystem(model, provider string) string {
+	return detectGenAIProvider(model, provider)
 }
 
 // classifyToolType returns a tool type string for span attributes.
