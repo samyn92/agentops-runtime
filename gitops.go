@@ -9,6 +9,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -165,6 +166,132 @@ func extractGitInfo() (commits int, prURL string) {
 	})
 
 	return count, ""
+}
+
+// prToolSuffixes are the MCP tool name suffixes that create pull requests / merge requests.
+// At runtime, tools are prefixed as "mcp_<serverName>_<toolName>".
+var prToolSuffixes = []string{
+	"gitlab_create_mr",
+	"github_create_pr",
+	"create_pull_request",
+	"create_merge_request",
+}
+
+// extractPullRequestURL scans the agent's step results for tool calls that
+// created a PR/MR and extracts the URL from the tool output JSON.
+// Returns the first PR URL found, or "" if none.
+func extractPullRequestURL(steps []fantasy.StepResult) string {
+	for _, step := range steps {
+		// Build a map of tool-call-id → tool-name from this step's messages
+		toolNames := map[string]string{}
+		for _, msg := range step.Messages {
+			for _, part := range msg.Content {
+				if tc, ok := part.(fantasy.ToolCallPart); ok {
+					toolNames[tc.ToolCallID] = tc.ToolName
+				}
+			}
+		}
+
+		// Scan tool results for PR/MR creation responses
+		for _, msg := range step.Messages {
+			for _, part := range msg.Content {
+				tr, ok := part.(fantasy.ToolResultPart)
+				if !ok {
+					continue
+				}
+
+				toolName := toolNames[tr.ToolCallID]
+				if !isPRTool(toolName) {
+					continue
+				}
+
+				// Extract the output text
+				var text string
+				switch v := tr.Output.(type) {
+				case fantasy.ToolResultOutputContentText:
+					text = v.Text
+				case fantasy.ToolResultOutputContentMedia:
+					text = v.Text
+				default:
+					continue
+				}
+
+				if url := parsePRURL(text); url != "" {
+					slog.Info("extracted pull request URL from tool result",
+						"tool", toolName, "url", url)
+					return url
+				}
+			}
+		}
+	}
+
+	return ""
+}
+
+// isPRTool checks if a tool name matches a known PR/MR creation tool.
+func isPRTool(name string) bool {
+	lower := strings.ToLower(name)
+	for _, suffix := range prToolSuffixes {
+		if strings.HasSuffix(lower, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// parsePRURL extracts the PR/MR URL from the raw JSON API response text.
+// Looks for "web_url" (GitLab) or "html_url" (GitHub).
+func parsePRURL(text string) string {
+	// Try to parse as JSON object
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(text), &obj); err != nil {
+		// Not valid JSON — try to find a URL pattern in plain text
+		return extractURLFromText(text)
+	}
+
+	// GitLab: "web_url"
+	if webURL, ok := obj["web_url"].(string); ok && webURL != "" {
+		return webURL
+	}
+
+	// GitHub: "html_url"
+	if htmlURL, ok := obj["html_url"].(string); ok && htmlURL != "" {
+		return htmlURL
+	}
+
+	return ""
+}
+
+// extractURLFromText tries to find a PR/MR URL in plain text output.
+// Handles cases where the tool output isn't raw JSON (e.g. formatted text).
+func extractURLFromText(text string) string {
+	// Look for common PR/MR URL patterns
+	patterns := []string{
+		"merge_requests/",
+		"/pull/",
+		"/pulls/",
+	}
+	for _, line := range strings.Split(text, "\n") {
+		for _, pattern := range patterns {
+			if idx := strings.Index(line, pattern); idx >= 0 {
+				// Walk backwards to find the start of the URL
+				start := idx
+				for start > 0 && line[start-1] != ' ' && line[start-1] != '"' && line[start-1] != '\'' && line[start-1] != '(' {
+					start--
+				}
+				// Walk forwards to find the end
+				end := idx + len(pattern)
+				for end < len(line) && line[end] != ' ' && line[end] != '"' && line[end] != '\'' && line[end] != ')' && line[end] != ',' {
+					end++
+				}
+				url := strings.TrimSpace(line[start:end])
+				if strings.HasPrefix(url, "http") {
+					return url
+				}
+			}
+		}
+	}
+	return ""
 }
 
 // ── Built-in Git Tools ──────────────────────────────────────────────────

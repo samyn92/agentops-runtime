@@ -1392,7 +1392,8 @@ func runTask() error {
 
 	// Extract git info from the agent's output if this was a git workspace run
 	if os.Getenv("GIT_REPO_URL") != "" {
-		result.Commits, result.PullRequestURL = extractGitInfo()
+		result.Commits, _ = extractGitInfo()
+		result.PullRequestURL = extractPullRequestURL(agentResult.Steps)
 	}
 
 	// End Engram session with raw messages (fixes session leak in task mode).
