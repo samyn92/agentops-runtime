@@ -129,13 +129,13 @@ func buildAgentBundle(ctx context.Context, cfg *Config, extraTools ...fantasy.Ag
 	// Wrap with security hooks + output truncation
 	tools = wrapToolsWithHooks(tools, cfg.ToolHooks, cfg.MaxToolResultChars)
 
-	// Add orchestration tools (run_agent, get_agent_run)
+	// Add orchestration tools (run_agent, get_agent_run, list_task_agents)
 	k8sClient, err := NewK8sClient()
 	if err != nil {
 		slog.Warn("K8s client unavailable, orchestration tools disabled", "error", err)
-		tools = append(tools, newRunAgentToolStub(), newGetAgentRunToolStub())
+		tools = append(tools, newRunAgentToolStub(), newGetAgentRunToolStub(), newListTaskAgentsToolStub())
 	} else {
-		tools = append(tools, newRunAgentTool(k8sClient, cfg.Resources), newGetAgentRunTool(k8sClient))
+		tools = append(tools, newRunAgentTool(k8sClient, cfg.Resources), newGetAgentRunTool(k8sClient), newListTaskAgentsTool(k8sClient))
 	}
 
 	// Add any extra tools (e.g. memory tools from Engram)
@@ -1654,5 +1654,105 @@ func newGetAgentRunToolStub() fantasy.AgentTool {
 		"Check the status and output of an AgentRun. (Unavailable: K8s client not configured)",
 		func(_ context.Context, _ getAgentRunInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			return fantasy.NewTextErrorResponse("get_agent_run unavailable: not running in Kubernetes"), nil
+		})
+}
+
+// ====================================================================
+// list_task_agents — discover available agents and their resources
+// ====================================================================
+
+type listTaskAgentsInput struct {
+	IncludeDaemons bool `json:"include_daemons,omitempty" description:"Include daemon agents in the list (default: only task agents)"`
+}
+
+func newListTaskAgentsTool(k8s *K8sClient) fantasy.AgentTool {
+	return fantasy.NewAgentTool("list_task_agents",
+		"List available agents with their capabilities and bound resources. "+
+			"Returns each agent's name, mode, phase, model, system prompt summary, and bound resources "+
+			"(git repos with owner/project info and default branches). "+
+			"Use this to decide which agent to delegate to and which git resources are available for run_agent.",
+		func(ctx context.Context, input listTaskAgentsInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
+			agents, err := k8s.ListAgentDetails(ctx)
+			if err != nil {
+				return fantasy.NewTextErrorResponse(fmt.Sprintf("Failed to list agents: %s", err)), nil
+			}
+
+			selfName := os.Getenv("AGENT_NAME")
+
+			var text strings.Builder
+			text.WriteString("Available agents:\n")
+			count := 0
+
+			for _, a := range agents {
+				// Skip self
+				if a.Name == selfName {
+					continue
+				}
+				// Filter by mode
+				if !input.IncludeDaemons && a.Mode == "daemon" {
+					continue
+				}
+
+				count++
+				text.WriteString(fmt.Sprintf("\n## %s\n", a.Name))
+				text.WriteString(fmt.Sprintf("  Mode: %s | Phase: %s", a.Mode, a.Phase))
+				if a.Model != "" {
+					text.WriteString(fmt.Sprintf(" | Model: %s", a.Model))
+				}
+				text.WriteString("\n")
+
+				if a.SystemPrompt != "" {
+					text.WriteString(fmt.Sprintf("  Purpose: %s\n", a.SystemPrompt))
+				}
+
+				if len(a.ResourceBindings) > 0 {
+					text.WriteString("  Resources:\n")
+					for _, r := range a.ResourceBindings {
+						switch r.Kind {
+						case "github-repo":
+							text.WriteString(fmt.Sprintf("    - %q (GitHub: %s/%s", r.Name, r.GitHubOwner, r.GitHubRepo))
+							if r.DefaultBranch != "" {
+								text.WriteString(fmt.Sprintf(", default: %s", r.DefaultBranch))
+							}
+							text.WriteString(")")
+						case "gitlab-project":
+							text.WriteString(fmt.Sprintf("    - %q (GitLab: %s", r.Name, r.GitLabProject))
+							if r.DefaultBranch != "" {
+								text.WriteString(fmt.Sprintf(", default: %s", r.DefaultBranch))
+							}
+							text.WriteString(")")
+						case "git-repo":
+							text.WriteString(fmt.Sprintf("    - %q (git: %s)", r.Name, r.GitURL))
+						default:
+							text.WriteString(fmt.Sprintf("    - %q (%s)", r.Name, r.Kind))
+						}
+						if r.Description != "" {
+							text.WriteString(fmt.Sprintf(" — %s", r.Description))
+						}
+						text.WriteString("\n")
+					}
+				}
+			}
+
+			if count == 0 {
+				return fantasy.NewTextResponse("No other agents found in this namespace."), nil
+			}
+
+			text.WriteString(fmt.Sprintf("\n(%d agents listed. Use run_agent to delegate tasks.)", count))
+
+			resp := fantasy.NewTextResponse(text.String())
+			resp = fantasy.WithResponseMetadata(resp, map[string]any{
+				"ui":    "agent-list",
+				"count": count,
+			})
+			return resp, nil
+		})
+}
+
+func newListTaskAgentsToolStub() fantasy.AgentTool {
+	return fantasy.NewAgentTool("list_task_agents",
+		"List available agents with their capabilities and bound resources. (Unavailable: K8s client not configured)",
+		func(_ context.Context, _ listTaskAgentsInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
+			return fantasy.NewTextErrorResponse("list_task_agents unavailable: not running in Kubernetes"), nil
 		})
 }

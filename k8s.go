@@ -22,10 +22,11 @@ import (
 )
 
 const (
-	apiGroup       = "agents.agentops.io"
-	apiVersion     = "v1alpha1"
-	agentRunPlural = "agentruns"
-	agentPlural    = "agents"
+	apiGroup            = "agents.agentops.io"
+	apiVersion          = "v1alpha1"
+	agentRunPlural      = "agentruns"
+	agentPlural         = "agents"
+	agentResourcePlural = "agentresources"
 )
 
 var agentRunGVR = schema.GroupVersionResource{
@@ -38,6 +39,12 @@ var agentGVR = schema.GroupVersionResource{
 	Group:    apiGroup,
 	Version:  apiVersion,
 	Resource: agentPlural,
+}
+
+var agentResourceGVR = schema.GroupVersionResource{
+	Group:    apiGroup,
+	Version:  apiVersion,
+	Resource: agentResourcePlural,
 }
 
 // K8sClient provides operations for AgentRun CRs.
@@ -76,6 +83,30 @@ type AgentInfo struct {
 	Phase string `json:"phase"`
 }
 
+// AgentDetail holds rich info about an Agent CR including resource bindings.
+type AgentDetail struct {
+	Name             string               `json:"name"`
+	Mode             string               `json:"mode"`
+	Phase            string               `json:"phase"`
+	Model            string               `json:"model,omitempty"`
+	SystemPrompt     string               `json:"systemPrompt,omitempty"`
+	ResourceBindings []AgentResourceBrief `json:"resourceBindings,omitempty"`
+}
+
+// AgentResourceBrief holds resolved info about a bound resource.
+type AgentResourceBrief struct {
+	Name          string `json:"name"`
+	Kind          string `json:"kind"`
+	DisplayName   string `json:"displayName"`
+	Description   string `json:"description,omitempty"`
+	DefaultBranch string `json:"defaultBranch,omitempty"`
+	// Provider-specific identifiers
+	GitHubOwner   string `json:"githubOwner,omitempty"`
+	GitHubRepo    string `json:"githubRepo,omitempty"`
+	GitLabProject string `json:"gitlabProject,omitempty"`
+	GitURL        string `json:"gitURL,omitempty"`
+}
+
 // GetAgent checks if an Agent CR exists and returns basic info.
 func (k *K8sClient) GetAgent(ctx context.Context, name string) (*AgentInfo, error) {
 	obj, err := k.client.Resource(agentGVR).Namespace(k.namespace).Get(ctx, name, metav1.GetOptions{})
@@ -104,6 +135,108 @@ func (k *K8sClient) ListAgents(ctx context.Context) ([]AgentInfo, error) {
 		agents = append(agents, AgentInfo{Name: name, Mode: mode, Phase: phase})
 	}
 	return agents, nil
+}
+
+// ListAgentDetails returns enriched Agent info including resource bindings.
+// It fetches all Agent CRs, reads their resourceBindings, and resolves each
+// binding name to the actual AgentResource CR for kind/display/config info.
+func (k *K8sClient) ListAgentDetails(ctx context.Context) ([]AgentDetail, error) {
+	list, err := k.client.Resource(agentGVR).Namespace(k.namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list agents: %w", err)
+	}
+
+	// Pre-fetch all AgentResource CRs in the namespace for efficient lookup
+	resourceMap, err := k.listAgentResourceMap(ctx)
+	if err != nil {
+		// Non-fatal: continue without resource details
+		resourceMap = map[string]*unstructured.Unstructured{}
+	}
+
+	agents := make([]AgentDetail, 0, len(list.Items))
+	for _, item := range list.Items {
+		name := item.GetName()
+		mode, _, _ := unstructured.NestedString(item.Object, "spec", "mode")
+		phase, _, _ := unstructured.NestedString(item.Object, "status", "phase")
+		model, _, _ := unstructured.NestedString(item.Object, "spec", "model")
+		systemPrompt, _, _ := unstructured.NestedString(item.Object, "spec", "systemPrompt")
+
+		// Truncate system prompt for display (first 200 chars)
+		if len(systemPrompt) > 200 {
+			systemPrompt = systemPrompt[:200] + "..."
+		}
+
+		detail := AgentDetail{
+			Name:         name,
+			Mode:         mode,
+			Phase:        phase,
+			Model:        model,
+			SystemPrompt: systemPrompt,
+		}
+
+		// Resolve resource bindings
+		bindings, _, _ := unstructured.NestedSlice(item.Object, "spec", "resourceBindings")
+		for _, b := range bindings {
+			bMap, ok := b.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			bindingName, _ := bMap["name"].(string)
+			if bindingName == "" {
+				continue
+			}
+
+			brief := k.resolveResourceBrief(bindingName, resourceMap)
+			detail.ResourceBindings = append(detail.ResourceBindings, brief)
+		}
+
+		agents = append(agents, detail)
+	}
+	return agents, nil
+}
+
+// listAgentResourceMap fetches all AgentResource CRs and indexes by name.
+func (k *K8sClient) listAgentResourceMap(ctx context.Context) (map[string]*unstructured.Unstructured, error) {
+	list, err := k.client.Resource(agentResourceGVR).Namespace(k.namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list agent resources: %w", err)
+	}
+	m := make(map[string]*unstructured.Unstructured, len(list.Items))
+	for i := range list.Items {
+		m[list.Items[i].GetName()] = &list.Items[i]
+	}
+	return m, nil
+}
+
+// resolveResourceBrief converts an AgentResource CR into a brief summary.
+func (k *K8sClient) resolveResourceBrief(name string, resourceMap map[string]*unstructured.Unstructured) AgentResourceBrief {
+	brief := AgentResourceBrief{Name: name}
+
+	obj, ok := resourceMap[name]
+	if !ok {
+		brief.Kind = "unknown"
+		brief.DisplayName = name
+		return brief
+	}
+
+	brief.Kind, _, _ = unstructured.NestedString(obj.Object, "spec", "kind")
+	brief.DisplayName, _, _ = unstructured.NestedString(obj.Object, "spec", "displayName")
+	brief.Description, _, _ = unstructured.NestedString(obj.Object, "spec", "description")
+
+	switch brief.Kind {
+	case "github-repo":
+		brief.GitHubOwner, _, _ = unstructured.NestedString(obj.Object, "spec", "github", "owner")
+		brief.GitHubRepo, _, _ = unstructured.NestedString(obj.Object, "spec", "github", "repo")
+		brief.DefaultBranch, _, _ = unstructured.NestedString(obj.Object, "spec", "github", "defaultBranch")
+	case "gitlab-project":
+		brief.GitLabProject, _, _ = unstructured.NestedString(obj.Object, "spec", "gitlab", "project")
+		brief.DefaultBranch, _, _ = unstructured.NestedString(obj.Object, "spec", "gitlab", "defaultBranch")
+	case "git-repo":
+		brief.GitURL, _, _ = unstructured.NestedString(obj.Object, "spec", "git", "url")
+		brief.DefaultBranch, _, _ = unstructured.NestedString(obj.Object, "spec", "git", "branch")
+	}
+
+	return brief
 }
 
 // AgentRunResult holds the result of creating an AgentRun.
