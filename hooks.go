@@ -179,6 +179,8 @@ func (h *hookWrappedTool) Run(ctx context.Context, call fantasy.ToolCall) (fanta
 			evAttrs = append(evAttrs, attribute.Bool("tool.error", true))
 		}
 		rootSpan.AddEvent("tool.call", trace.WithAttributes(evAttrs...))
+	} else {
+		slog.Debug("root span not in context, skipping tool.call event", "tool", toolName)
 	}
 
 	return result, err

@@ -213,6 +213,64 @@ func setLLMResultAttributes(span trace.Span, result *fantasy.AgentResult, model 
 	}
 
 	span.SetAttributes(attrs...)
+
+	// Record tool.call events from step results on this span.
+	// This is the reliable path — individual tool.execute spans are often
+	// lost by the batch exporter for short-lived task pods, but the
+	// gen_ai.generate span always survives. The console UI synthesizes
+	// waterfall rows from these events.
+	recordToolCallEventsFromSteps(span, result.Steps)
+}
+
+// recordToolCallEventsFromSteps iterates agent steps and records a tool.call
+// event for every tool invocation found in the step response content. Each
+// event carries the tool name, type, step number, and error status so the
+// console UI can render a compact waterfall without needing the full
+// tool.execute child spans (which are often lost by the batch exporter in
+// short-lived task pods).
+func recordToolCallEventsFromSteps(span trace.Span, steps []fantasy.StepResult) {
+	toolCount := 0
+	for stepIdx, step := range steps {
+		// Collect tool call IDs that had error results so we can flag them.
+		errorCalls := make(map[string]bool)
+		for _, content := range step.Content {
+			if content.GetType() != fantasy.ContentTypeToolResult {
+				continue
+			}
+			tr, ok := fantasy.AsContentType[fantasy.ToolResultContent](content)
+			if !ok {
+				continue
+			}
+			if tr.Result != nil && tr.Result.GetType() == fantasy.ToolResultContentTypeError {
+				errorCalls[tr.ToolCallID] = true
+			}
+		}
+
+		// Now record tool.call events for each tool call in this step.
+		for _, content := range step.Content {
+			if content.GetType() != fantasy.ContentTypeToolCall {
+				continue
+			}
+			tc, ok := fantasy.AsContentType[fantasy.ToolCallContent](content)
+			if !ok {
+				continue
+			}
+			evAttrs := []attribute.KeyValue{
+				attribute.String("tool.name", tc.ToolName),
+				attribute.String("tool.type", classifyToolType(tc.ToolName)),
+				attribute.Int("tool.step", stepIdx+1),
+			}
+			if errorCalls[tc.ToolCallID] {
+				evAttrs = append(evAttrs, attribute.Bool("tool.error", true))
+			}
+			span.AddEvent("tool.call", trace.WithAttributes(evAttrs...))
+			toolCount++
+		}
+	}
+	if toolCount > 0 {
+		span.SetAttributes(attribute.Int("agent.tool_calls", toolCount))
+		slog.Info("recorded tool.call events on gen_ai.generate span", "count", toolCount)
+	}
 }
 
 // detectGenAIProvider infers the gen_ai.provider.name from model/provider names.
