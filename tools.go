@@ -21,8 +21,15 @@ import (
 	"charm.land/fantasy"
 )
 
+// readOnlyBuiltinTools lists built-in tools that are safe for parallel execution.
+// These tools perform no mutations and can run concurrently without data races.
+var readOnlyBuiltinTools = map[string]bool{
+	"read": true, "grep": true, "ls": true, "glob": true, "fetch": true,
+}
+
 // buildBuiltinTools returns the requested built-in tools.
 // No tools are granted by default — only explicitly listed tools are enabled.
+// Read-only tools are created with NewParallelAgentTool for concurrent dispatch.
 func buildBuiltinTools(names []string) []fantasy.AgentTool {
 	if len(names) == 0 {
 		return nil
@@ -114,7 +121,7 @@ type readInput struct {
 }
 
 func newReadTool() fantasy.AgentTool {
-	return fantasy.NewAgentTool("read",
+	return fantasy.NewParallelAgentTool("read",
 		"Read the contents of a file. Supports text files. Use offset/limit for large files.",
 		func(_ context.Context, input readInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			if input.Path == "" {
@@ -257,7 +264,7 @@ type grepInput struct {
 }
 
 func newGrepTool() fantasy.AgentTool {
-	return fantasy.NewAgentTool("grep",
+	return fantasy.NewParallelAgentTool("grep",
 		"Search for a regex pattern in files using ripgrep (rg). Returns matching lines with file paths and line numbers.",
 		func(ctx context.Context, input grepInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			if input.Pattern == "" {
@@ -302,7 +309,7 @@ type lsInput struct {
 }
 
 func newLsTool() fantasy.AgentTool {
-	return fantasy.NewAgentTool("ls",
+	return fantasy.NewParallelAgentTool("ls",
 		"List directory contents with file types and sizes.",
 		func(_ context.Context, input lsInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			path := input.Path
@@ -342,7 +349,7 @@ type globInput struct {
 }
 
 func newGlobTool() fantasy.AgentTool {
-	return fantasy.NewAgentTool("glob",
+	return fantasy.NewParallelAgentTool("glob",
 		"Find files matching a glob pattern. Returns matching file paths.",
 		func(_ context.Context, input globInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			if input.Pattern == "" {
@@ -390,7 +397,7 @@ type fetchInput struct {
 }
 
 func newFetchTool() fantasy.AgentTool {
-	return fantasy.NewAgentTool("fetch",
+	return fantasy.NewParallelAgentTool("fetch",
 		"Fetch the contents of a URL. Returns the response body as text.",
 		func(ctx context.Context, input fetchInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			if input.URL == "" {

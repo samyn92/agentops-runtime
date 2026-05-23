@@ -195,6 +195,38 @@ func buildAgentBundle(ctx context.Context, cfg *Config, engram *EngramClient, in
 		opts = append(opts, fantasy.WithStopConditions(fantasy.StepCountIs(*cfg.MaxSteps)))
 	}
 
+	// MaxTokensBudget: hard cap on total tokens per invocation (cost control).
+	if cfg.MaxTokensBudget != nil && *cfg.MaxTokensBudget > 0 {
+		opts = append(opts, fantasy.WithStopConditions(fantasy.MaxTokensUsed(*cfg.MaxTokensBudget)))
+		slog.Info("max tokens budget configured", "maxTokens", *cfg.MaxTokensBudget)
+	}
+
+	// Tool call repair: automatically retry malformed tool calls using the model.
+	opts = append(opts, fantasy.WithRepairToolCall(defaultRepairToolCall))
+
+	// Retry configuration with OTEL observability.
+	maxRetries := 2
+	if cfg.MaxRetries != nil && *cfg.MaxRetries >= 0 {
+		maxRetries = *cfg.MaxRetries
+	}
+	opts = append(opts, fantasy.WithMaxRetries(maxRetries))
+	opts = append(opts, fantasy.WithOnRetry(func(provErr *fantasy.ProviderError, delay time.Duration) {
+		slog.Warn("retrying provider call",
+			"error", provErr.Error(),
+			"delay", delay,
+			"statusCode", provErr.StatusCode,
+		)
+		// Record retry event on active span if available
+		span := trace.SpanFromContext(context.Background())
+		if span.IsRecording() {
+			span.AddEvent("gen_ai.retry", trace.WithAttributes(
+				attribute.String("error.message", provErr.Error()),
+				attribute.Int("error.status_code", provErr.StatusCode),
+				attribute.Float64("retry.delay_ms", float64(delay.Milliseconds())),
+			))
+		}
+	}))
+
 	// Input token budget guard: stop the agent loop before context window overflow.
 	// Uses 75% of the model's context window as the budget by default.
 	budgetFraction := DefaultBudgetFraction

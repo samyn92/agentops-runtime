@@ -702,7 +702,9 @@ func newMemSaveTool(engram *EngramClient) fantasy.AgentTool {
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("failed to save memory: %s", err)), nil
 			}
 
-			return fantasy.NewTextResponse(fmt.Sprintf("Saved [%s] %s", input.Type, input.Title)), nil
+			resp := fantasy.NewTextResponse(fmt.Sprintf("Saved [%s] %s", input.Type, input.Title))
+			resp.StopTurn = true // Signal: memory saved, no follow-up model call needed
+			return resp, nil
 		})
 }
 
@@ -714,7 +716,7 @@ type memSearchInput struct {
 }
 
 func newMemSearchTool(engram *EngramClient) fantasy.AgentTool {
-	return fantasy.NewAgentTool("mem_search",
+	return fantasy.NewParallelAgentTool("mem_search",
 		"Search long-term memory (Engram) using full-text search. Returns matching observations ranked by relevance. Use this to recall past decisions, discoveries, bugfixes, and lessons.",
 		func(ctx context.Context, input memSearchInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			if input.Query == "" {
@@ -752,7 +754,7 @@ type memContextInput struct {
 }
 
 func newMemContextTool(engram *EngramClient) fantasy.AgentTool {
-	return fantasy.NewAgentTool("mem_context",
+	return fantasy.NewParallelAgentTool("mem_context",
 		"Retrieve recent memory context — recent observations and session summaries. Use this to refresh your knowledge about what happened in previous sessions.",
 		func(ctx context.Context, input memContextInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			limit := input.Limit

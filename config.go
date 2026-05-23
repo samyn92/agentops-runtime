@@ -50,6 +50,20 @@ type Config struct {
 	// When a step's input tokens exceed this fraction, the agent loop stops.
 	// Default: 0.75. Valid range: (0, 1).
 	BudgetFraction *float64 `json:"budgetFraction,omitempty"`
+
+	// MaxTokensBudget is a hard cap on total tokens (input + output) consumed
+	// across all steps in a single agent invocation. When exceeded, the agent
+	// loop stops. Useful for cost control. Zero means no limit.
+	MaxTokensBudget *int64 `json:"maxTokensBudget,omitempty"`
+
+	// MaxRetries is the number of times to retry on provider errors (429, 500, etc.)
+	// before falling back to fallback models. Default: 2.
+	MaxRetries *int `json:"maxRetries,omitempty"`
+
+	// ParallelToolExecution enables concurrent execution of tools marked as parallel-safe.
+	// When true, read-only built-in tools and MCP tools from read-only servers are
+	// dispatched concurrently. Default: true.
+	ParallelToolExecution *bool `json:"parallelToolExecution,omitempty"`
 }
 
 // MemoryConfig configures the Engram memory integration.

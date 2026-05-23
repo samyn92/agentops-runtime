@@ -288,9 +288,11 @@ func newRunFinishTool(k8s *K8sClient) fantasy.AgentTool {
 					"run_finish: patch failed: %v", err)), nil
 			}
 
-			return fantasy.NewTextResponse(fmt.Sprintf(
+			resp := fantasy.NewTextResponse(fmt.Sprintf(
 				"Outcome recorded: intent=%s, %d artifact(s). Console will reflect on next refresh.",
-				input.Intent, len(outcome.Artifacts))), nil
+				input.Intent, len(outcome.Artifacts)))
+			resp.StopTurn = true // Signal: outcome recorded, agent should stop
+			return resp, nil
 		},
 	)
 }
