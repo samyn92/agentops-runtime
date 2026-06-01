@@ -133,6 +133,14 @@ func buildAgentBundle(ctx context.Context, cfg *Config, engram *EngramClient, in
 		slog.Info("built-in git tools enabled", "count", len(gitTools()))
 	}
 
+	// Add native GitLab tools when a GitLab identity is bound (GITLAB_TOKEN set
+	// by the operator from a gitlab-group/gitlab-project Integration). These use
+	// the official GitLab Go SDK — no OCI mcp-gitlab sidecar needed. Write tools
+	// are auto-disabled when GITLAB_READONLY=true.
+	if glTools := gitlabTools(); len(glTools) > 0 {
+		tools = append(tools, glTools...)
+	}
+
 	// Add orchestration tools (run_agent, run_agents, get_agent_run, list_task_agents)
 	// Only agents with a delegation team configured get these tools. Without a team,
 	// task agents would have unrestricted delegation and create infinite loops
